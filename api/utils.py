@@ -11,7 +11,7 @@ def not_null(value):
 
 def is_email(email):
     try:
-        if "@" and "." in email:
+        if "@" in email and "." in email:
             return email
         else:
             raise Exception("Malformed email")

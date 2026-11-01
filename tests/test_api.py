@@ -37,3 +37,30 @@ def test_register_success(client, monkeypatch):
     response = client.post("/api/register", json=payload)
     assert response.status_code == 200
     assert response.get_json() is True
+
+
+def test_login_missing_data(client):
+    response = client.post("/api/login", data="null", content_type="application/json")
+    assert response.status_code == 400
+    assert response.get_json()["message"] == "Data is null"
+
+
+def test_login_invalid_credentials(client, monkeypatch):
+    monkeypatch.setattr("main.auth_user", lambda login, pwd: None)
+
+    response = client.post("/api/login", json={"login": "nobody", "password": "wrongpassword"})
+    assert response.status_code == 404
+    assert response.get_json()["message"] == "User not found"
+
+
+def test_login_success(client, monkeypatch):
+    mock_user = {"uid": 1, "username": "alice", "email": "alice@example.com"}
+    monkeypatch.setattr("main.auth_user", lambda login, pwd: mock_user)
+
+    response = client.post("/api/login", json={"login": "alice", "password": "secretpassword"})
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["message"] == "Login successful"
+    assert "token" in data
+    assert "." in data["token"]
+
