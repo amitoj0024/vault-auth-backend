@@ -14,7 +14,7 @@ load_dotenv()
 
 
 def auth_user(login, password):
-    query = "SELECT uid, username, email, password, is_active FROM users WHERE username = %s OR email = %s"
+    query = "SELECT uid, username, email, full_name, password, is_active FROM users WHERE username = %s OR email = %s"
     try:
         result = execute_query(query, (login, login))
         if isinstance(result, list) and len(result) > 0:
@@ -35,7 +35,8 @@ def auth_user(login, password):
                 return {
                     "uid": user.get("uid"),
                     "username": user.get("username"),
-                    "email": user.get("email")
+                    "email": user.get("email"),
+                    "full_name": user.get("full_name")
                 }
         return None
     except Exception as e:
@@ -55,13 +56,15 @@ def register(data):
     hashed_password = generate_password_hash(str(raw_password))
     c_date = datetime.now().strftime("%Y-%m-%d")
     explicit_uid = data.get("uid")
+    full_name = data.get("fullName") or data.get("full_name") or data.get("name")
+    phone = data.get("phone")
 
     if explicit_uid is not None:
-        query = "INSERT INTO users (uid, username, password, email, c_date) VALUES (%s, %s, %s, %s, %s) RETURNING uid"
-        params = (explicit_uid, username, hashed_password, email, c_date)
+        query = "INSERT INTO users (uid, username, password, email, c_date, full_name, phone, is_active) VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE) RETURNING uid"
+        params = (explicit_uid, username, hashed_password, email, c_date, full_name, phone)
     else:
-        query = "INSERT INTO users (username, password, email, c_date) VALUES (%s, %s, %s, %s) RETURNING uid"
-        params = (username, hashed_password, email, c_date)
+        query = "INSERT INTO users (username, password, email, c_date, full_name, phone, is_active) VALUES (%s, %s, %s, %s, %s, %s, TRUE) RETURNING uid"
+        params = (username, hashed_password, email, c_date, full_name, phone)
 
     try:
         result = execute_query(query, params)
@@ -89,13 +92,13 @@ def register(data):
 
 def get_users(data=None):
     if isinstance(data, int):
-        query = "SELECT uid, username, email, is_active FROM users WHERE uid = %s"
+        query = "SELECT uid, username, email, full_name, is_active FROM users WHERE uid = %s"
         params = (data,)
     elif data is None:
-        query = "SELECT uid, username, email, is_active FROM users"
+        query = "SELECT uid, username, email, full_name, is_active FROM users"
         params = None
     elif isinstance(data, str):
-        query = "SELECT uid, username, email, is_active FROM users WHERE username = %s OR email = %s"
+        query = "SELECT uid, username, email, full_name, is_active FROM users WHERE username = %s OR email = %s"
         params = (data, data)
     else:
         return None

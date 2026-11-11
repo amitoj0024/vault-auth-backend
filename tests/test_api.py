@@ -39,6 +39,22 @@ def test_register_success(client, monkeypatch):
     assert response.get_json() is True
 
 
+def test_register_missing_fields(client):
+    payload = {"username": "bob"}
+    response = client.post("/api/register", json=payload)
+    assert response.status_code == 400
+    assert "required" in response.get_json()["message"]
+
+
+def test_register_duplicate_failure_400(client, monkeypatch):
+    monkeypatch.setattr("main.register", lambda data: False)
+
+    payload = {"username": "existing_user", "password": "secure123", "email": "existing@example.com"}
+    response = client.post("/api/register", json=payload)
+    assert response.status_code == 400
+    assert "taken" in response.get_json()["message"]
+
+
 def test_login_missing_data(client):
     response = client.post("/api/login", data="null", content_type="application/json")
     assert response.status_code == 400

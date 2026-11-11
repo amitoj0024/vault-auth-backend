@@ -72,9 +72,19 @@ def create_user():
     data = request.get_json()
     if data is None:
         return jsonify({"message": "Data is null"}), 400
+
+    username = data.get("username")
+    password = data.get("password")
+    email = data.get("email")
+
+    if not username or not password or not email:
+        return jsonify({"message": "Username, email, and password are required"}), 400
+
     try:
         result = register(data)
-        return jsonify(result)
+        if result is False:
+            return jsonify({"message": "Registration failed. Username or email may already be taken."}), 400
+        return jsonify(result), 200
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
 

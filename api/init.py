@@ -9,7 +9,8 @@ def create_tables():
         uid SERIAL PRIMARY KEY,
         username VARCHAR(50) NOT NULL UNIQUE,
         password VARCHAR(255) NOT NULL,
-        email VARCHAR(100) NOT NULL,
+        email VARCHAR(100) NOT NULL UNIQUE,
+        full_name VARCHAR(100),
         phone VARCHAR(20),
         is_active BOOLEAN DEFAULT TRUE,
         c_date DATE NOT NULL
@@ -38,9 +39,11 @@ def create_tables():
         execute_query(users_table)
         execute_query(tokens_table)
         execute_query(otps_table)
-        # Migrate existing tables if they don't have phone or is_active column yet
+        # Migrate existing tables if they don't have phone, full_name, or is_active column yet
+        execute_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS full_name VARCHAR(100);")
         execute_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(20);")
         execute_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;")
+        execute_query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email);")
         execute_query("UPDATE users SET is_active = TRUE WHERE is_active IS NULL;")
         execute_query("ALTER TABLE otps ADD COLUMN IF NOT EXISTS phone VARCHAR(20);")
         return True
