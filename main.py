@@ -35,6 +35,14 @@ app.secret_key = os.getenv("TOKEN_SECRET", "vault-auth-secret-key-change-in-prod
 
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
+from api.security import add_security_headers, log_security_event, rate_limit
+
+@app.after_request
+def apply_security_headers(response):
+    return add_security_headers(response)
+
+app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1 MB max request size
+
 
 @app.route("/", methods=["GET"])
 @app.route("/api", methods=["GET"])
@@ -87,6 +95,7 @@ def username(id):
 
 
 @app.route("/api/register", methods=["POST"])
+@rate_limit(max_requests=5, window_seconds=300, key_prefix="register")
 def create_user():
     data = request.get_json()
     if data is None:
@@ -99,6 +108,22 @@ def create_user():
     if not username or not password or not email:
         return jsonify({"message": "Username, email, and password are required"}), 400
 
+    from api.security import validate_password_strength, validate_username, validate_email
+    # Validate password strength
+    pwd_valid, pwd_strength, pwd_errors = validate_password_strength(password)
+    if not pwd_valid:
+        return jsonify({"message": "Password too weak", "errors": pwd_errors}), 400
+    # Validate email format
+    try:
+        email = validate_email(email)
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+    # Validate username format
+    try:
+        username = validate_username(username)
+    except ValueError as e:
+        return jsonify({"message": str(e)}), 400
+
     try:
         result = register(data)
         if result is False:
@@ -109,6 +134,7 @@ def create_user():
 
 
 @app.route("/api/login", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=60, key_prefix="login")
 def login():
     data = request.get_json()
     if data is None:
@@ -177,6 +203,7 @@ def mask_email(email):
 
 @app.route("/api/otp/send", methods=["POST"])
 @app.route("/api/login/otp/send", methods=["POST"])
+@rate_limit(max_requests=5, window_seconds=60, key_prefix="otp_send")
 def send_otp():
     data = request.get_json() if request.is_json else {}
     if not data:
@@ -238,6 +265,7 @@ def send_otp():
 @app.route("/api/otp/verify", methods=["POST"])
 @app.route("/api/login/otp/verify", methods=["POST"])
 @app.route("/api/login/otp", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=60, key_prefix="otp_verify")
 def verify_otp_endpoint():
     data = request.get_json() if request.is_json else {}
     if not data:
@@ -498,6 +526,64 @@ def user_profile():
     except Exception as e:
         safe_print(f"User profile error: {e}")
         return jsonify({"message": f"Error retrieving profile: {e}"}), 500
+
+
+# --- Admin-only endpoints ---
+from api.rbac import require_admin, get_user_role, is_admin
+
+@app.route("/api/admin/users", methods=["GET"])
+@require_auth
+@require_admin
+def admin_list_users():
+    """Admin-only: list all users."""
+    try:
+        rows = get_users(None)
+        # Strip password from response
+        safe_rows = []
+        for u in (rows or []):
+            safe_rows.append({
+                "uid": u.get("uid"),
+                "username": u.get("username"),
+                "email": u.get("email"),
+                "full_name": u.get("full_name"),
+                "is_active": u.get("is_active"),
+            })
+        return jsonify(safe_rows), 200
+    except Exception as e:
+        safe_print(f"[Admin] list users error: {e}")
+        return jsonify({"message": "Error retrieving users"}), 500
+
+
+@app.route("/api/admin/users/<int:uid>/role", methods=["PUT"])
+@require_auth
+@require_admin
+def admin_set_user_role(uid):
+    """Admin-only: set a user's role (cannot be done by normal users)."""
+    try:
+        data = request.get_json() or {}
+        new_role = str(data.get("role", "")).lower().strip()
+        from api.rbac import VALID_ROLES
+        if new_role not in VALID_ROLES:
+            return jsonify({"success": False, "message": f"Invalid role. Valid roles: {list(VALID_ROLES)}"}), 400
+        from api.db import execute_query as eq
+        eq("UPDATE users SET role = %s WHERE uid = %s", (new_role, uid))
+        safe_print(f"[RBAC] Admin uid={g.user['uid']} changed uid={uid} role to {new_role}")
+        return jsonify({"success": True, "message": f"Role updated to '{new_role}'"}), 200
+    except Exception as e:
+        safe_print(f"[Admin] set role error: {e}")
+        return jsonify({"message": "Error updating role"}), 500
+
+
+@app.route("/api/user/role", methods=["GET"])
+@require_auth
+def get_my_role():
+    """Return the authenticated user's role."""
+    try:
+        from api.rbac import get_user_role
+        role = get_user_role(g.user["uid"])
+        return jsonify({"role": role, "uid": g.user["uid"]}), 200
+    except Exception as e:
+        return jsonify({"message": "Error fetching role"}), 500
 
 
 if __name__ == "__main__":
