@@ -47,6 +47,8 @@ def create_tables():
         execute_query("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email);")
         execute_query("UPDATE users SET is_active = TRUE WHERE is_active IS NULL;")
         execute_query("ALTER TABLE otps ADD COLUMN IF NOT EXISTS phone VARCHAR(20);")
+        execute_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user';")
+        execute_query("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);")
         return True
     except Exception as e:
         return f"Error: {e}"
