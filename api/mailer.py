@@ -44,6 +44,22 @@ def _get_smtp_config():
     }
 
 
+def is_smtp_configured():
+    """Return True when SMTP username and password are present."""
+    cfg = _get_smtp_config()
+    return bool(cfg["user"] and cfg["password"])
+
+
+def is_plunk_configured():
+    """Return True when Plunk API key is configured."""
+    return bool((os.getenv("PLUNK_API_KEY") or "").strip())
+
+
+def is_email_configured():
+    """Return True when any transactional email provider (SMTP or Plunk) is configured."""
+    return is_smtp_configured() or is_plunk_configured()
+
+
 def _send_via_smtp(cfg, to_email, subject, html_content, text_content, context_label):
     """Send email over SMTP supporting STARTTLS (587) and implicit SSL (465)."""
     msg = MIMEMultipart("alternative")
@@ -127,14 +143,26 @@ def _send_via_plunk(plunk_key, to_email, subject, html_content, context_label):
 
 
 def _dispatch_email(to_email, subject, html_content, text_content, context_label):
-    """Dispatch email via SMTP if configured, otherwise Plunk API."""
+    """Dispatch email via SMTP if configured, falling back to Plunk API if available."""
     smtp_cfg = _get_smtp_config()
+    plunk_key = (os.getenv("PLUNK_API_KEY") or "").strip()
+
     if smtp_cfg["user"] and smtp_cfg["password"]:
-        return _send_via_smtp(
+        ok, smtp_err = _send_via_smtp(
             smtp_cfg, to_email, subject, html_content, text_content, context_label
         )
+        if ok:
+            return True, None
+        if plunk_key:
+            safe_print(f"[Mailer] SMTP failed ({smtp_err}); attempting Plunk fallback")
+            plunk_ok, plunk_err = _send_via_plunk(
+                plunk_key, to_email, subject, html_content, context_label
+            )
+            if plunk_ok:
+                return True, None
+            return False, f"{smtp_err} (Plunk fallback also failed: {plunk_err})"
+        return False, smtp_err
 
-    plunk_key = (os.getenv("PLUNK_API_KEY") or "").strip()
     if plunk_key:
         return _send_via_plunk(
             plunk_key, to_email, subject, html_content, context_label

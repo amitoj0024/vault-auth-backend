@@ -193,25 +193,12 @@ def verify_and_save_passkey_registration(user: Dict[str, Any], credential_payloa
     except Exception as e:
         safe_print(f"[WebAuthn clientDataJSON Parse Warning]: {e}")
 
-    # Consume matching challenge
+    # Consume matching challenge (strictly require exact challenge match; never pick arbitrary latest row)
     expected_challenge_bytes = consume_webauthn_challenge(
         challenge_str=client_challenge_str,
         expected_type="registration",
         uid=uid
     )
-
-    if not expected_challenge_bytes:
-        # Fallback: check if any valid registration challenge exists for user
-        now = datetime.now()
-        fallback_rows = execute_query(
-            "SELECT id, challenge_str, challenge_bytes FROM webauthn_challenges WHERE uid = %s AND challenge_type = 'registration' AND expires_at >= %s ORDER BY id DESC LIMIT 1",
-            (uid, now)
-        )
-        if isinstance(fallback_rows, list) and len(fallback_rows) > 0:
-            rec = fallback_rows[0]
-            execute_query("DELETE FROM webauthn_challenges WHERE id = %s", (rec["id"],))
-            raw_b = rec["challenge_bytes"]
-            expected_challenge_bytes = bytes(raw_b) if isinstance(raw_b, (bytes, bytearray, memoryview)) else base64url_to_bytes(rec["challenge_str"])
 
     if not expected_challenge_bytes:
         record_audit_log("WEBAUTHN_REGISTER_FAILED", actor_uid=uid, actor_username=username,
@@ -397,25 +384,12 @@ def verify_passkey_authentication(credential_payload: Dict[str, Any], client_ip:
     except Exception as e:
         safe_print(f"[WebAuthn clientDataJSON Parse Warning]: {e}")
 
-    # Consume matching challenge
+    # Consume matching challenge (strictly require exact challenge match; never consume foreign challenge)
     expected_challenge_bytes = consume_webauthn_challenge(
         challenge_str=client_challenge_str,
         expected_type="authentication",
         uid=None
     )
-
-    if not expected_challenge_bytes:
-        # Fallback: check any pending auth challenge
-        now = datetime.now()
-        fallback_rows = execute_query(
-            "SELECT id, challenge_str, challenge_bytes FROM webauthn_challenges WHERE challenge_type = 'authentication' AND expires_at >= %s ORDER BY id DESC LIMIT 1",
-            (now,)
-        )
-        if isinstance(fallback_rows, list) and len(fallback_rows) > 0:
-            rec = fallback_rows[0]
-            execute_query("DELETE FROM webauthn_challenges WHERE id = %s", (rec["id"],))
-            raw_b = rec["challenge_bytes"]
-            expected_challenge_bytes = bytes(raw_b) if isinstance(raw_b, (bytes, bytearray, memoryview)) else base64url_to_bytes(rec["challenge_str"])
 
     if not expected_challenge_bytes:
         record_audit_log(

@@ -1,5 +1,6 @@
 """Security utilities: password validation, input sanitization, rate limiting, security headers, and security event logging."""
 
+import os
 import re
 import time
 import logging
@@ -47,15 +48,24 @@ _rate_buckets = defaultdict(list)
 _last_cleanup = 0.0
 
 
-def _get_client_ip():
+def get_client_ip(req=None):
+    """Resolve client IP safely; ignore X-Forwarded-For unless explicitly trusted."""
+    r = req if req is not None else request
     try:
-        xff = request.headers.get("X-Forwarded-For", "")
-        if xff:
-            # Client IP is the first non-empty component
-            return xff.split(",")[0].strip()
-        return request.remote_addr or "127.0.0.1"
+        trust_proxy = os.getenv("TRUST_PROXY_HEADERS", "false").strip().lower() in ("true", "1", "yes")
+        if trust_proxy:
+            xff = r.headers.get("X-Forwarded-For", "")
+            if xff:
+                first = xff.split(",")[0].strip()
+                if first:
+                    return first
+        return r.remote_addr or "127.0.0.1"
     except Exception:
         return "127.0.0.1"
+
+
+def _get_client_ip():
+    return get_client_ip(request)
 
 
 def rate_limit(max_requests=10, window_seconds=60, key_prefix="rl"):
@@ -151,18 +161,19 @@ def validate_username(username):
     return username
 
 
-def validate_password_strength(password):
+def validate_password_strength(password, min_length=8):
     """
     Validate password policy and evaluate strength.
-    Enforces minimum 8 characters and checks against empty or trivial weak passwords.
+    Enforces minimum length (at least 8) and checks against empty or trivial weak passwords.
     Returns: (is_valid: bool, strength: str, errors: list[str])
     """
     if not password or not isinstance(password, str):
         return False, "Weak", ["Password cannot be empty."]
 
+    required_len = max(8, int(min_length or 8))
     errors = []
-    if len(password) < 8:
-        errors.append("Password must be at least 8 characters long.")
+    if len(password) < required_len:
+        errors.append(f"Password must be at least {required_len} characters long.")
 
     if password.lower() in _COMMON_WEAK_PASSWORDS:
         errors.append("Password is too common and easily guessed.")
@@ -198,10 +209,10 @@ def validate_password_strength(password):
     return True, strength, []
 
 
-def validate_reset_password(password):
+def validate_reset_password(password, min_length=8):
     """
-    Enforce strict password complexity rules for password reset:
-    - Minimum 8 characters
+    Enforce strict password complexity rules for password reset/change:
+    - Minimum configured length (at least 8 characters)
     - At least one uppercase letter
     - At least one lowercase letter
     - At least one digit
@@ -211,9 +222,10 @@ def validate_reset_password(password):
     if not password or not isinstance(password, str):
         return False, "Weak", ["Password cannot be empty."]
 
+    required_len = max(8, int(min_length or 8))
     errors = []
-    if len(password) < 8:
-        errors.append("Password must be at least 8 characters long.")
+    if len(password) < required_len:
+        errors.append(f"Password must be at least {required_len} characters long.")
     if not re.search(r'[A-Z]', password):
         errors.append("Password must include at least one uppercase letter.")
     if not re.search(r'[a-z]', password):

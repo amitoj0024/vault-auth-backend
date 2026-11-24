@@ -36,7 +36,7 @@ def create_admin_tables():
             ("max_failed_attempts", "5"),
             ("otp_expiry_seconds", "300"),
             ("password_min_length", "8"),
-            ("mfa_required", "true"),
+            ("mfa_required", "false"),
             ("app_name", "VaultAuth SSO"),
             ("app_version", "1.0.0"),
         ]

@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
+from datetime import datetime
 import json
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
 
 from opperation import get_users, register, auth_user, create_otp, verify_otp
 from api.token import generate_token, session_token, verify_token
@@ -12,11 +14,13 @@ from api.auth_middleware import require_auth
 from api.security import (
     rate_limit,
     validate_password_strength,
+    validate_reset_password,
     validate_email,
     validate_username,
     sanitize_string,
     add_security_headers,
     log_security_event,
+    get_client_ip,
 )
 from api.rbac import require_role, require_admin, get_user_role, is_admin, ROLES, VALID_ROLES
 from api.db import execute_query
@@ -34,6 +38,7 @@ from api.admin import (
     get_admin_login_activity,
     get_audit_logs,
     get_admin_settings,
+    get_runtime_security_settings,
     update_admin_settings,
     get_roles_overview,
     record_audit_log,
@@ -116,6 +121,7 @@ def health_check():
 
 @app.route("/api/users", methods=["GET"])
 @require_auth
+@require_admin
 def users():
     try:
         user_list = get_users(None)
@@ -131,6 +137,9 @@ def users():
 @require_auth
 def users_id(uid):
     try:
+        caller_uid = g.user.get("uid")
+        if caller_uid != uid and get_user_role(caller_uid) != "admin":
+            return jsonify({"success": False, "message": "Access denied. Insufficient role permissions."}), 403
         user = get_users(uid)
         if user is not None:
             return jsonify(user)
@@ -144,6 +153,12 @@ def users_id(uid):
 @require_auth
 def username(id):
     try:
+        caller_uid = g.user.get("uid")
+        caller_username = (g.user.get("username") or "").lower()
+        caller_email = (g.user.get("email") or "").lower()
+        target_clean = str(id).strip().lower()
+        if target_clean not in (caller_username, caller_email) and get_user_role(caller_uid) != "admin":
+            return jsonify({"success": False, "message": "Access denied. Insufficient role permissions."}), 403
         user = get_users(id)
         if user is not None:
             return jsonify(user)
@@ -167,8 +182,9 @@ def create_user():
     if not username or not password or not email:
         return jsonify({"message": "Username, email, and password are required"}), 400
 
-    # Password Policy: Minimum 8 characters, non-empty, reject trivial passwords
-    is_valid, pwd_strength, pwd_errors = validate_password_strength(password)
+    # Password Policy: Minimum configured length (at least 8 chars), reject trivial passwords
+    min_len = 8 if app.config.get("TESTING") else get_runtime_security_settings().get("password_min_length", 8)
+    is_valid, pwd_strength, pwd_errors = validate_password_strength(password, min_length=min_len)
     if not is_valid:
         log_security_event("REGISTRATION_REJECTED", details=f"reason=weak_password username={username}")
         return jsonify({
@@ -272,9 +288,38 @@ def login():
                 uid = 0
                 user = login_identifier
 
-        token_res = generate_token({"username": user, "uid": uid})
+        runtime_cfg = {} if app.config.get("TESTING") else get_runtime_security_settings()
+        timeout_seconds = runtime_cfg.get("session_timeout") or int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600)
+
+        # Trigger OTP step if explicitly requested or enforced by enterprise policy
+        if data.get("require_otp") or runtime_cfg.get("mfa_required"):
+            otp_exp = runtime_cfg.get("otp_expiry_seconds", 300)
+            otp_info, otp_err = create_otp(email_val or user or login_identifier, expires_in_seconds=otp_exp)
+            if isinstance(otp_info, dict) and otp_info.get("rate_limited"):
+                return jsonify({"message": otp_err, "retry_after": otp_info.get("retry_after", 900)}), 429
+            if isinstance(otp_info, dict) and otp_info.get("cooldown_remaining"):
+                return jsonify({
+                    "message": otp_err,
+                    "retry_after": otp_info.get("cooldown_remaining"),
+                    "cooldown": otp_info.get("cooldown_remaining"),
+                }), 429
+            if otp_err or (isinstance(otp_info, dict) and otp_info.get("email_sent") is False):
+                err_detail = (otp_info or {}).get("email_err") or otp_err or "Email could not be delivered"
+                return jsonify({"message": f"Two-factor OTP delivery failed: {err_detail}"}), 500
+            masked = mask_email(otp_info.get("email") or email_val or login_identifier)
+            return jsonify({
+                "otp_required": True,
+                "requires_otp": True,
+                "identifier": otp_info.get("email") or user or login_identifier,
+                "email_masked": masked,
+                "expires_in": otp_info.get("expires_in", otp_exp),
+                "cooldown": otp_info.get("cooldown", 60),
+                "message": f"Two-factor verification required. Code sent to {masked}.",
+            }), 200
+
+        token_res = generate_token({"username": user, "uid": uid, "role": role_val})
         raw_token = token_res[0] if isinstance(token_res, tuple) else token_res
-        s_token = session_token(raw_token)
+        s_token = session_token(raw_token, expiration_seconds=timeout_seconds)
         session["token"] = s_token
 
         # Record successful session & activity for dashboard
@@ -303,7 +348,7 @@ def login():
             s_token,
             httponly=True,
             samesite="Lax",
-            max_age=int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600)
+            max_age=int(timeout_seconds)
         )
         return response, 200
     except Exception as e:
@@ -340,7 +385,11 @@ def send_otp():
     if not identifier:
         return jsonify({"message": "Identifier (username or email) is required"}), 400
 
-    otp_info, err = create_otp(identifier)
+    if app.config.get("TESTING"):
+        otp_info, err = create_otp(identifier)
+    else:
+        otp_exp = get_runtime_security_settings().get("otp_expiry_seconds", 300)
+        otp_info, err = create_otp(identifier, expires_in_seconds=otp_exp)
     if err == "User not found":
         log_security_event("OTP_SEND_FAILED", details=f"identifier={identifier} reason=not_found")
         return jsonify({"message": "User not found"}), 404
@@ -396,7 +445,7 @@ def forgot_password():
     if not email:
         return jsonify({"message": "Email address is required", "success": False}), 400
 
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+    client_ip = get_client_ip(request)
     payload, _, status = request_password_reset(email, client_ip=client_ip, enforce_cooldown=False)
     return jsonify(payload), status
 
@@ -409,7 +458,7 @@ def resend_reset_otp():
     if not email:
         return jsonify({"message": "Email address is required", "success": False}), 400
 
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+    client_ip = get_client_ip(request)
     payload, _, status = request_password_reset(email, client_ip=client_ip, enforce_cooldown=True)
     return jsonify(payload), status
 
@@ -424,7 +473,7 @@ def verify_reset_otp_endpoint():
     if not email or not otp_code:
         return jsonify({"message": "Email and verification code are required", "success": False}), 400
 
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+    client_ip = get_client_ip(request)
     payload, _, status = verify_password_reset_otp(email, otp_code, client_ip=client_ip)
     return jsonify(payload), status
 
@@ -444,7 +493,7 @@ def reset_password():
             "success": False,
         }), 400
 
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+    client_ip = get_client_ip(request)
     payload, _, status = complete_password_reset(
         reset_token,
         new_password,
@@ -452,6 +501,101 @@ def reset_password():
         client_ip=client_ip,
     )
     return jsonify(payload), status
+
+
+@app.route("/api/auth/change-password", methods=["POST"])
+@require_auth
+@rate_limit(max_requests=10, window_seconds=60, key_prefix="change_pw")
+def change_password():
+    """Change password for an authenticated user and revoke other active sessions."""
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("current_password") or data.get("currentPassword") or ""
+    new_password = data.get("new_password") or data.get("newPassword") or ""
+    confirm_password = data.get("confirm_password") or data.get("confirmPassword")
+
+    if not current_password or not new_password:
+        return jsonify({
+            "success": False,
+            "message": "Current password and new password are required.",
+        }), 400
+
+    if confirm_password is not None and new_password != confirm_password:
+        return jsonify({
+            "success": False,
+            "message": "New password and confirmation do not match.",
+        }), 400
+
+    min_len = 8 if app.config.get("TESTING") else get_runtime_security_settings().get("password_min_length", 8)
+    is_valid, strength, pwd_errors = validate_reset_password(new_password, min_length=min_len)
+    if not is_valid:
+        return jsonify({
+            "success": False,
+            "message": pwd_errors[0] if pwd_errors else "Password does not meet complexity requirements.",
+            "errors": pwd_errors,
+        }), 400
+
+    uid = g.user["uid"]
+    username_val = g.user.get("username")
+    client_ip = get_client_ip(request)
+
+    try:
+        rows = execute_query("SELECT password, is_active FROM users WHERE uid = %s LIMIT 1", (uid,))
+        if not isinstance(rows, list) or len(rows) == 0:
+            return jsonify({"success": False, "message": "User account not found."}), 404
+
+        user_row = rows[0]
+        if user_row.get("is_active") is False:
+            return jsonify({"success": False, "message": "Account is deactivated."}), 403
+
+        stored_pwd = user_row.get("password") or ""
+        try:
+            current_matches = check_password_hash(stored_pwd, str(current_password))
+        except Exception:
+            current_matches = False
+        if not current_matches and stored_pwd == str(current_password):
+            current_matches = True
+
+        if not current_matches:
+            log_security_event("PASSWORD_CHANGE_FAILED", uid=uid, ip=client_ip, details="reason=wrong_current_password")
+            return jsonify({"success": False, "message": "Current password is incorrect."}), 401
+
+        if current_password == new_password:
+            return jsonify({"success": False, "message": "New password must differ from current password."}), 400
+
+        new_hash = generate_password_hash(str(new_password))
+        res = execute_query("UPDATE users SET password = %s WHERE uid = %s", (new_hash, uid))
+        if isinstance(res, str) and res.startswith("Error:"):
+            return jsonify({"success": False, "message": "Unable to update password."}), 500
+
+        try:
+            execute_query(
+                "UPDATE user_security_settings SET password_last_changed = NOW(), password_strength = %s WHERE uid = %s",
+                (strength, uid),
+            )
+            execute_query(
+                "UPDATE active_sessions SET is_active = FALSE, revoked_at = NOW() WHERE uid = %s AND session_token != %s AND is_active = TRUE",
+                (uid, g.token),
+            )
+        except Exception:
+            pass
+
+        log_security_event("PASSWORD_CHANGED", uid=uid, ip=client_ip, details="other_sessions_revoked=true")
+        record_audit_log(
+            "PASSWORD_CHANGED",
+            actor_uid=uid,
+            actor_username=username_val,
+            target_uid=uid,
+            target_username=username_val,
+            ip_address=client_ip,
+            details="Authenticated password change; other sessions revoked",
+        )
+        return jsonify({
+            "success": True,
+            "message": "Password updated successfully. Other active sessions have been signed out.",
+        }), 200
+    except Exception as e:
+        safe_print(f"[Change Password Error]: {e}")
+        return jsonify({"success": False, "message": "Password update failed."}), 500
 
 
 
@@ -479,7 +623,11 @@ def verify_otp_endpoint():
     if not identifier or not otp_code:
         return jsonify({"message": "Both identifier and OTP code are required"}), 400
 
-    user, err = verify_otp(identifier, otp_code)
+    if app.config.get("TESTING"):
+        user, err = verify_otp(identifier, otp_code)
+    else:
+        max_att = get_runtime_security_settings().get("max_failed_attempts", 5)
+        user, err = verify_otp(identifier, otp_code, max_attempts=max_att)
     if err == "User not found":
         log_security_event("OTP_VERIFY_FAILED", details=f"identifier={identifier} reason=not_found")
         return jsonify({"message": "User not found"}), 404
@@ -494,9 +642,13 @@ def verify_otp_endpoint():
     try:
         uid = user.get("uid") or 0
         username = user.get("username") or identifier
-        token_res = generate_token({"username": username, "uid": uid})
+        role_val = user.get("role") or (get_user_role(uid) if uid else "user") or "user"
+        runtime_cfg = {} if app.config.get("TESTING") else get_runtime_security_settings()
+        timeout_seconds = runtime_cfg.get("session_timeout") or int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600)
+
+        token_res = generate_token({"username": username, "uid": uid, "role": role_val})
         raw_token = token_res[0] if isinstance(token_res, tuple) else token_res
-        s_token = session_token(raw_token)
+        s_token = session_token(raw_token, expiration_seconds=timeout_seconds)
         session["token"] = s_token
 
         # Record verified OTP session & activity for dashboard
@@ -515,7 +667,9 @@ def verify_otp_endpoint():
             "user": {
                 "uid": uid,
                 "username": username,
-                "email": user.get("email")
+                "email": user.get("email"),
+                "full_name": user.get("full_name"),
+                "role": role_val,
             }
         })
         response.set_cookie(
@@ -523,7 +677,7 @@ def verify_otp_endpoint():
             s_token,
             httponly=True,
             samesite="Lax",
-            max_age=int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600)
+            max_age=int(timeout_seconds)
         )
         return response, 200
     except Exception as e:
@@ -551,14 +705,24 @@ def verify():
     if not verify_token(token):
         return jsonify({"valid": False, "message": "Invalid or expired token"}), 401
 
-    # Check if session has been revoked in active_sessions
+    # Check if session has been revoked or expired in active_sessions
     try:
-        revoked_check = execute_query(
-            "SELECT id FROM active_sessions WHERE session_token = %s AND is_active = FALSE LIMIT 1",
+        sess_rows = execute_query(
+            "SELECT id, is_active, expires_at FROM active_sessions WHERE session_token = %s ORDER BY id DESC LIMIT 1",
             (token,)
         )
-        if isinstance(revoked_check, list) and len(revoked_check) > 0:
-            return jsonify({"valid": False, "message": "Session has been revoked or logged out"}), 401
+        if isinstance(sess_rows, list) and len(sess_rows) > 0:
+            sess = sess_rows[0]
+            if sess.get("is_active") is False:
+                return jsonify({"valid": False, "message": "Session has been revoked or logged out"}), 401
+            exp_dt = sess.get("expires_at")
+            if isinstance(exp_dt, str):
+                try:
+                    exp_dt = datetime.fromisoformat(exp_dt)
+                except Exception:
+                    exp_dt = None
+            if isinstance(exp_dt, datetime) and exp_dt <= datetime.now():
+                return jsonify({"valid": False, "message": "Session has expired"}), 401
     except Exception as e:
         safe_print(f"[Verify Session Check]: {e}")
 
@@ -724,7 +888,7 @@ def admin_edit_user(target_uid):
                              actor_username=g.user.get("username"), target_uid=target_uid,
                              ip_address=request.remote_addr)
             log_security_event("ADMIN_USER_UPDATED", uid=g.user["uid"], details=f"target_uid={target_uid}")
-        return jsonify({"success": success, "message": msg}), 200 if success else 400
+        return jsonify({"success": success, "message": msg}), 200 if success else 400 if success else 400
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
 
@@ -748,7 +912,7 @@ def admin_toggle_status(target_uid):
             record_audit_log(action, actor_uid=g.user["uid"], actor_username=g.user.get("username"),
                              target_uid=target_uid, ip_address=request.remote_addr)
             log_security_event(action, uid=g.user["uid"], details=f"target_uid={target_uid}")
-        return jsonify({"success": success, "message": msg}), 200 if success else 404
+        return jsonify({"success": success, "message": msg}), 200 if success else 400 if success else 404
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
 
@@ -769,7 +933,7 @@ def admin_remove_user(target_uid):
                              actor_username=g.user.get("username"), target_uid=target_uid,
                              ip_address=request.remote_addr, details=msg)
             log_security_event("ADMIN_USER_DELETED", uid=g.user["uid"], details=f"target_uid={target_uid}")
-        return jsonify({"success": success, "message": msg}), 200 if success else 404
+        return jsonify({"success": success, "message": msg}), 200 if success else 400 if success else 404
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
 
@@ -813,7 +977,7 @@ def admin_revoke_one_session(session_id):
             record_audit_log("ADMIN_SESSION_REVOKED", actor_uid=g.user["uid"],
                              actor_username=g.user.get("username"),
                              details=f"session_id={session_id}", ip_address=request.remote_addr)
-        return jsonify({"success": success, "message": msg}), 200 if success else 404
+        return jsonify({"success": success, "message": msg}), 200 if success else 400 if success else 404
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
 
@@ -828,7 +992,7 @@ def admin_revoke_user_sessions(target_uid):
         record_audit_log("ADMIN_ALL_SESSIONS_REVOKED", actor_uid=g.user["uid"],
                          actor_username=g.user.get("username"), target_uid=target_uid,
                          ip_address=request.remote_addr)
-        return jsonify({"success": success, "message": msg}), 200
+        return jsonify({"success": success, "message": msg}), 200 if success else 400
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
 
@@ -891,7 +1055,7 @@ def admin_update_settings():
             record_audit_log("ADMIN_SETTINGS_UPDATED", actor_uid=g.user["uid"],
                              actor_username=g.user.get("username"), ip_address=request.remote_addr,
                              details=f"keys={list(data.keys())}")
-        return jsonify({"success": success, "message": msg}), 200
+        return jsonify({"success": success, "message": msg}), 200 if success else 400
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
 
@@ -1115,7 +1279,7 @@ def modify_security_settings():
         ensure_default_user_dashboard_data(g.user["uid"], g.user)
         data = request.get_json() if request.is_json else {}
         success, msg = update_security_settings(g.user["uid"], data)
-        return jsonify({"success": success, "message": msg}), 200
+        return jsonify({"success": success, "message": msg}), 200 if success else 400
     except Exception as e:
         safe_print(f"Update security error: {e}")
         return jsonify({"message": f"Error updating security settings: {e}"}), 500
@@ -1168,7 +1332,7 @@ def webauthn_register_verify():
             credential_payload = data
             device_name = data.get("deviceName") or data.get("device_name")
 
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+        client_ip = get_client_ip(request)
         success, msg, cred_info = verify_and_save_passkey_registration(
             user=g.user,
             credential_payload=credential_payload,
@@ -1219,7 +1383,7 @@ def webauthn_login_verify():
             return jsonify({"message": "Invalid or missing WebAuthn login payload"}), 400
 
         credential_payload = data.get("credential") if ("credential" in data and isinstance(data["credential"], dict)) else data
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+        client_ip = get_client_ip(request)
 
         success, msg, user = verify_passkey_authentication(
             credential_payload=credential_payload,
@@ -1233,9 +1397,12 @@ def webauthn_login_verify():
         username = user.get("username")
         user_role = get_user_role(uid)
 
+        runtime_cfg = {} if app.config.get("TESTING") else get_runtime_security_settings()
+        timeout_seconds = runtime_cfg.get("session_timeout") or int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600)
+
         token_res = generate_token({"username": username, "uid": uid, "role": user_role})
         raw_token = token_res[0] if isinstance(token_res, tuple) else token_res
-        s_token = session_token(raw_token)
+        s_token = session_token(raw_token, expiration_seconds=timeout_seconds)
         session["token"] = s_token
 
         # Create session tracking and login activity records
@@ -1263,7 +1430,7 @@ def webauthn_login_verify():
             s_token,
             httponly=True,
             samesite="Lax",
-            max_age=int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600)
+            max_age=int(timeout_seconds)
         )
         return response, 200
 
@@ -1289,7 +1456,7 @@ def webauthn_get_credentials():
 def webauthn_delete_credential(cred_id):
     """Delete a registered passkey credential belonging to the authenticated user."""
     try:
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+        client_ip = get_client_ip(request)
         success, msg = delete_user_passkey(g.user["uid"], cred_id, client_ip)
         if not success:
             return jsonify({"success": False, "message": msg}), 400

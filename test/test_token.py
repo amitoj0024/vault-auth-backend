@@ -22,3 +22,15 @@ def test_verify_token_expired():
     expired_timestamp = int(time.time()) - 3600
     expired_token = f"{md5_hash}.{expired_timestamp}"
     assert verify_token(expired_token) is False
+
+
+def test_verify_token_rejects_forged_and_tampered_tokens():
+    # Unsigned two-part token must be rejected
+    assert verify_token("098f6bcd4621d373cade4e832627b4f6.9999999999") is False
+    # Forged signature must be rejected
+    assert verify_token(f"098f6bcd4621d373cade4e832627b4f6.9999999999.{'a' * 64}") is False
+    # Modifying expiration breaks HMAC signature
+    valid = session_token("testuser123")
+    parts = valid.split(".")
+    tampered = f"{parts[0]}.{int(parts[1]) + 100}.{parts[2]}"
+    assert verify_token(tampered) is False

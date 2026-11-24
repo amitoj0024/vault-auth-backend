@@ -27,7 +27,7 @@ config = {
     "DEBUG": os.environ.get('DEBUG', 'False'),
     "SESSION_TYPE": "filesystem",
     "SESSION_PERMANENT": False,
-    "SESSION_EXPIRES": int(os.environ.get('SESSION_Expires', '3600') or 3600),
+    "SESSION_EXPIRES": int(os.environ.get('SESSION_EXPIRES', '3600') or 3600),
     "SESSION_KEY_PREFIX": "session",
     "SESSION_COOKIE_NAME": "token",
     "SESSION_COOKIE_DOMAIN": None,

@@ -14,9 +14,10 @@ load_dotenv()
 
 
 def auth_user(login, password):
-    query = "SELECT uid, username, email, full_name, password, is_active, role FROM users WHERE username = %s OR email = %s"
+    login_str = str(login).strip()
+    query = "SELECT uid, username, email, full_name, password, is_active, role FROM users WHERE username = %s OR LOWER(email) = %s"
     try:
-        result = execute_query(query, (login, login))
+        result = execute_query(query, (login_str, login_str.lower()))
         if isinstance(result, list) and len(result) > 0:
             user = result[0]
             if user.get("is_active") is False:
@@ -98,14 +99,15 @@ def register(data):
 
 def get_users(data=None):
     if isinstance(data, int):
-        query = "SELECT uid, username, email, full_name, is_active FROM users WHERE uid = %s"
+        query = "SELECT uid, username, email, full_name, is_active, role FROM users WHERE uid = %s"
         params = (data,)
     elif data is None:
-        query = "SELECT uid, username, email, full_name, is_active FROM users"
+        query = "SELECT uid, username, email, full_name, is_active, role FROM users"
         params = None
     elif isinstance(data, str):
-        query = "SELECT uid, username, email, full_name, is_active FROM users WHERE username = %s OR email = %s"
-        params = (data, data)
+        ident = data.strip()
+        query = "SELECT uid, username, email, full_name, is_active, role FROM users WHERE username = %s OR LOWER(email) = %s"
+        params = (ident, ident.lower())
     else:
         return None
     try:
@@ -184,7 +186,7 @@ def create_otp(identifier, expires_in_seconds=300):
     except Exception as e:
         safe_print(f"[OTP Invalidate Previous Notice]: {e}")
 
-    # Store masked placeholder in legacy otp_code column to prevent plaintext storage in DB
+    # Never store plaintext OTP in DB; always store masked placeholder + SHA-256 hash
     masked_otp = "******"
     query = """
     INSERT INTO otps (uid, email, otp_code, otp_hash, created_at, expires_at, used, attempts)
@@ -193,20 +195,19 @@ def create_otp(identifier, expires_in_seconds=300):
     params = (uid, email, masked_otp, otp_hash, now, expires_at)
     res = execute_query(query, params)
     if isinstance(res, str) and res.startswith("Error:"):
-        # Graceful fallback if database schema is missing otp_hash or attempts columns
         fallback_query = """
-        INSERT INTO otps (uid, email, otp_code, created_at, expires_at, used)
-        VALUES (%s, %s, %s, %s, %s, FALSE)
+        INSERT INTO otps (uid, email, otp_code, otp_hash, created_at, expires_at, used)
+        VALUES (%s, %s, %s, %s, %s, %s, FALSE)
         """
-        fallback_res = execute_query(fallback_query, (uid, email, otp_code, now, expires_at))
+        fallback_res = execute_query(fallback_query, (uid, email, masked_otp, otp_hash, now, expires_at))
         if isinstance(fallback_res, str) and fallback_res.startswith("Error:"):
             return None, res
 
-    # Send real email via Plunk
+    # Send real email via SMTP/Plunk
     email_sent, email_err = send_otp_email(email, otp_code, user.get("username"))
     if not email_sent:
         try:
-            execute_query("DELETE FROM otps WHERE uid = %s AND (otp_hash = %s OR otp_code = %s)", (uid, otp_hash, otp_code))
+            execute_query("DELETE FROM otps WHERE uid = %s AND otp_hash = %s", (uid, otp_hash))
         except Exception:
             pass
 
@@ -221,7 +222,7 @@ def create_otp(identifier, expires_in_seconds=300):
     }, None
 
 
-def verify_otp(identifier, otp_code):
+def verify_otp(identifier, otp_code, max_attempts=5):
     if not identifier or not otp_code:
         return None, "Identifier and OTP code are required"
 
@@ -236,15 +237,17 @@ def verify_otp(identifier, otp_code):
     uid = user.get("uid")
     code = str(otp_code).strip()
     now = datetime.now()
+    active_otp_id = None
 
-    # Brute-force protection: check if active OTP reached maximum 5 failed attempts
+    # Brute-force protection: check if active OTP reached maximum failed attempts
     try:
         attempt_check = execute_query(
             "SELECT id, attempts FROM otps WHERE uid = %s AND used = FALSE AND expires_at >= %s ORDER BY id DESC LIMIT 1",
             (uid, now)
         )
         if isinstance(attempt_check, list) and len(attempt_check) > 0:
-            if (attempt_check[0].get("attempts") or 0) >= 5:
+            active_otp_id = attempt_check[0].get("id")
+            if (attempt_check[0].get("attempts") or 0) >= max_attempts:
                 return None, "Maximum OTP attempts exceeded. Please request a new OTP."
     except Exception as e:
         safe_print(f"[OTP Attempt Check]: {e}")
@@ -273,12 +276,13 @@ def verify_otp(identifier, otp_code):
         res = execute_query(fallback_query, (uid, code, now))
 
     if not isinstance(res, list) or len(res) == 0:
-        # Increment attempt counter on the active OTP
+        # Increment attempt counter only on the active OTP row
         try:
-            execute_query(
-                "UPDATE otps SET attempts = attempts + 1 WHERE uid = %s AND used = FALSE AND expires_at >= %s",
-                (uid, now)
-            )
+            if active_otp_id is not None:
+                execute_query(
+                    "UPDATE otps SET attempts = attempts + 1 WHERE id = %s",
+                    (active_otp_id,)
+                )
         except Exception:
             pass
         return None, "Invalid or expired OTP"

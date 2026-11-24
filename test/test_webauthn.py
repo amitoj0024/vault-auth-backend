@@ -270,3 +270,27 @@ def test_delete_credential_success(client, auth_headers, monkeypatch):
     assert res.status_code == 200
     assert res.get_json()["success"] is True
     assert "Passkey successfully removed" in res.get_json()["message"]
+
+
+def test_verify_passkey_authentication_rejects_mismatched_challenge(monkeypatch):
+    """Authentication fails when clientDataJSON challenge does not match any pending challenge (no arbitrary fallback)."""
+    from api import webauthn_service
+
+    create_webauthn_challenge(uid=1, challenge_type="authentication")
+    monkeypatch.setattr(
+        webauthn_service,
+        "execute_query",
+        lambda q, p=None: (
+            [{"id": 1, "uid": 1, "credential_id": "cred_1", "public_key": b"pk", "sign_count": 0, "device_name": "Key"}]
+            if "FROM webauthn_credentials" in q
+            else ([{"uid": 1, "username": "alice", "email": "alice@example.com", "full_name": "Alice", "is_active": True, "role": "user"}] if "FROM users" in q else [])
+        ),
+    )
+
+    ok, msg, user = webauthn_service.verify_passkey_authentication({
+        "id": "cred_1",
+        "response": {"clientDataJSON": "eyJjaGFsbGVuZ2UiOiJub3QtYS1yZWFsLWNoYWxsZW5nZSJ9"},
+    })
+    assert ok is False
+    assert user is None
+    assert "expired" in msg.lower()

@@ -89,12 +89,12 @@ class _FakeCursor:
             self._rows = [dict(u) for u in self.db.users if u["email"].lower() == target][:1]
             return
 
-        if "FROM USERS WHERE USERNAME = %S OR EMAIL = %S" in q_upper:
+        if "FROM USERS WHERE USERNAME = %S OR LOWER(EMAIL) = %S" in q_upper or "FROM USERS WHERE USERNAME = %S OR EMAIL = %S" in q_upper:
             a, b = params[0], params[1]
             self._rows = [
                 dict(u)
                 for u in self.db.users
-                if u["username"] == a or u["email"] == b
+                if u["username"] == a or u["email"].lower() == str(b).lower()
             ]
             return
 

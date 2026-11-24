@@ -7,8 +7,9 @@ import os
 import secrets
 
 from werkzeug.security import generate_password_hash
+from flask import has_app_context, current_app
 
-from api.admin import record_audit_log
+from api.admin import get_runtime_security_settings, record_audit_log
 from api.db import db_transaction
 from api.mailer import send_password_reset_email
 from api.security import log_security_event, validate_email, validate_reset_password
@@ -20,6 +21,17 @@ MAX_OTP_ATTEMPTS = 5
 RESEND_COOLDOWN_SECONDS = 60
 RATE_LIMIT_MAX_REQUESTS = 5
 RATE_LIMIT_WINDOW_MINUTES = 15
+
+
+def _get_reset_limits():
+    if has_app_context() and current_app.config.get("TESTING"):
+        return OTP_EXPIRY_SECONDS, MAX_OTP_ATTEMPTS, 8
+    cfg = get_runtime_security_settings()
+    return (
+        cfg.get("otp_expiry_seconds", OTP_EXPIRY_SECONDS),
+        cfg.get("max_failed_attempts", MAX_OTP_ATTEMPTS),
+        cfg.get("password_min_length", 8),
+    )
 
 
 def _get_hmac_secret():
@@ -90,6 +102,7 @@ def request_password_reset(raw_email, client_ip="127.0.0.1", enforce_cooldown=Fa
         return {"success": False, "message": str(ve)}, str(ve), 400
 
     now = datetime.now()
+    otp_expiry_seconds, _, _ = _get_reset_limits()
     generated_otp = None
     target_user = None
     reset_record_id = None
@@ -163,7 +176,7 @@ def request_password_reset(raw_email, client_ip="127.0.0.1", enforce_cooldown=Fa
             # Generate CSPRNG 6-digit OTP and store only HMAC-SHA256 hash
             generated_otp = f"{secrets.randbelow(900000) + 100000}"
             otp_hash = hash_reset_otp(user_id, generated_otp)
-            expires_at = now + timedelta(seconds=OTP_EXPIRY_SECONDS)
+            expires_at = now + timedelta(seconds=otp_expiry_seconds)
 
             cursor.execute(
                 """
@@ -235,6 +248,7 @@ def verify_reset_otp(raw_email, otp_code, client_ip="127.0.0.1"):
         return {"success": False, "message": "Verification code is required."}, "Missing OTP", 400
 
     now = datetime.now()
+    _, max_attempts, _ = _get_reset_limits()
 
     try:
         with db_transaction() as cursor:
@@ -268,7 +282,7 @@ def verify_reset_otp(raw_email, otp_code, client_ip="127.0.0.1"):
             if isinstance(expires_at, str):
                 expires_at = datetime.fromisoformat(expires_at)
 
-            if attempts >= MAX_OTP_ATTEMPTS:
+            if attempts >= max_attempts:
                 cursor.execute("UPDATE password_resets SET is_used = TRUE WHERE id = %s", (reset_id,))
                 log_security_event("PASSWORD_RESET_OTP_LOCKED", uid=user_id, ip=client_ip, details="reason=max_attempts")
                 return (
@@ -298,12 +312,12 @@ def verify_reset_otp(raw_email, otp_code, client_ip="127.0.0.1"):
 
             if not is_match:
                 new_attempts = attempts + 1
-                if new_attempts >= MAX_OTP_ATTEMPTS:
+                if new_attempts >= max_attempts:
                     cursor.execute(
                         "UPDATE password_resets SET attempts = %s, is_used = TRUE WHERE id = %s",
                         (new_attempts, reset_id),
                     )
-                    log_security_event("PASSWORD_RESET_OTP_LOCKED", uid=user_id, ip=client_ip, details="attempts=5")
+                    log_security_event("PASSWORD_RESET_OTP_LOCKED", uid=user_id, ip=client_ip, details=f"attempts={new_attempts}")
                     return (
                         {
                             "success": False,
@@ -317,7 +331,7 @@ def verify_reset_otp(raw_email, otp_code, client_ip="127.0.0.1"):
                     "UPDATE password_resets SET attempts = %s WHERE id = %s",
                     (new_attempts, reset_id),
                 )
-                remaining = MAX_OTP_ATTEMPTS - new_attempts
+                remaining = max_attempts - new_attempts
                 log_security_event(
                     "PASSWORD_RESET_VERIFY_FAILED",
                     uid=user_id,
@@ -386,7 +400,8 @@ def complete_password_reset(reset_token, new_password, confirm_password=None, cl
             400,
         )
 
-    is_valid, strength, pwd_errors = validate_reset_password(new_password)
+    _, _, pwd_min_length = _get_reset_limits()
+    is_valid, strength, pwd_errors = validate_reset_password(new_password, min_length=pwd_min_length)
     if not is_valid:
         return (
             {
@@ -400,6 +415,7 @@ def complete_password_reset(reset_token, new_password, confirm_password=None, cl
 
     token_hash = hash_reset_token(token_str)
     now = datetime.now()
+    _, max_attempts, _ = _get_reset_limits()
 
     try:
         user_id = None

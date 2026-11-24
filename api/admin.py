@@ -142,9 +142,10 @@ def admin_create_user(username, email, password, full_name=None, phone=None, rol
     from werkzeug.security import generate_password_hash
     from api.security import validate_email, validate_username, validate_password_strength, sanitize_string
     try:
-        validate_email(email)
-        validate_username(username)
-        ok, _, errs = validate_password_strength(password)
+        email = validate_email(email)
+        username = validate_username(username)
+        sec_cfg = get_runtime_security_settings()
+        ok, _, errs = validate_password_strength(password, min_length=sec_cfg["password_min_length"])
         if not ok:
             return False, f"Weak password: {'; '.join(errs)}"
 
@@ -461,8 +462,37 @@ def get_audit_logs(search=None, event_filter=None, page=1, per_page=25):
         return {"logs": [], "total": 0, "page": 1, "per_page": per_page, "pages": 1}
 
 
+def get_runtime_security_settings():
+    """Fetch enforced runtime security settings with safe defaults if DB is unavailable."""
+    defaults = {
+        "session_timeout": int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600),
+        "max_failed_attempts": 5,
+        "otp_expiry_seconds": 300,
+        "password_min_length": 8,
+        "mfa_required": False,
+    }
+    try:
+        rows = execute_query("SELECT setting_key, setting_value FROM admin_settings")
+        if isinstance(rows, list):
+            mapping = {r["setting_key"]: r["setting_value"] for r in rows if isinstance(r, dict)}
+            if str(mapping.get("session_timeout", "")).isdigit():
+                defaults["session_timeout"] = max(60, min(86400, int(mapping["session_timeout"])))
+            if str(mapping.get("max_failed_attempts", "")).isdigit():
+                defaults["max_failed_attempts"] = max(3, min(20, int(mapping["max_failed_attempts"])))
+            if str(mapping.get("otp_expiry_seconds", "")).isdigit():
+                defaults["otp_expiry_seconds"] = max(60, min(900, int(mapping["otp_expiry_seconds"])))
+            if str(mapping.get("password_min_length", "")).isdigit():
+                defaults["password_min_length"] = max(8, min(32, int(mapping["password_min_length"])))
+            if "mfa_required" in mapping:
+                defaults["mfa_required"] = str(mapping["mfa_required"]).strip().lower() in ("true", "1", "yes")
+    except Exception:
+        pass
+    return defaults
+
+
 def get_admin_settings():
     """Retrieve all admin settings (non-secret)."""
+    from api.mailer import is_smtp_configured, is_plunk_configured, is_email_configured
     try:
         rows = execute_query("SELECT setting_key, setting_value FROM admin_settings ORDER BY id")
         settings = {}
@@ -470,8 +500,12 @@ def get_admin_settings():
             for r in rows:
                 settings[r["setting_key"]] = r["setting_value"]
         # Augment with read-only env-derived values (never expose secrets)
-        settings["otp_configured"] = bool(os.getenv("PLUNK_API_KEY"))
-        settings["smtp_configured"] = bool(os.getenv("PLUNK_API_KEY"))
+        smtp_ready = is_smtp_configured()
+        plunk_ready = is_plunk_configured()
+        settings["smtp_configured"] = smtp_ready
+        settings["plunk_configured"] = plunk_ready
+        settings["otp_configured"] = is_email_configured()
+        settings["mail_provider"] = "SMTP" if smtp_ready else ("Plunk" if plunk_ready else "Unconfigured")
         settings["cors_origins"] = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5500")
         return settings
     except Exception as e:
@@ -480,7 +514,10 @@ def get_admin_settings():
 
 
 def update_admin_settings(updates, actor_uid):
-    """Update admin settings (safe keys only)."""
+    """Update admin settings (safe keys only with validation)."""
+    if not isinstance(updates, dict):
+        return False, "Invalid settings payload"
+
     ALLOWED_KEYS = {
         "session_timeout", "max_failed_attempts", "otp_expiry_seconds",
         "password_min_length", "mfa_required", "app_name"
@@ -489,10 +526,53 @@ def update_admin_settings(updates, actor_uid):
     for key, val in updates.items():
         if key not in ALLOWED_KEYS:
             continue
-        execute_query(
-            "UPDATE admin_settings SET setting_value = %s, updated_at = NOW() WHERE setting_key = %s",
-            (str(val), key)
+        if key == "session_timeout":
+            try:
+                num = int(val)
+                if num < 60 or num > 86400:
+                    return False, "session_timeout must be between 60 and 86400 seconds"
+                clean_val = str(num)
+            except (TypeError, ValueError):
+                return False, "session_timeout must be a valid integer"
+        elif key == "otp_expiry_seconds":
+            try:
+                num = int(val)
+                if num < 60 or num > 900:
+                    return False, "otp_expiry_seconds must be between 60 and 900 seconds"
+                clean_val = str(num)
+            except (TypeError, ValueError):
+                return False, "otp_expiry_seconds must be a valid integer"
+        elif key == "max_failed_attempts":
+            try:
+                num = int(val)
+                if num < 3 or num > 20:
+                    return False, "max_failed_attempts must be between 3 and 20"
+                clean_val = str(num)
+            except (TypeError, ValueError):
+                return False, "max_failed_attempts must be a valid integer"
+        elif key == "password_min_length":
+            try:
+                num = int(val)
+                if num < 8 or num > 32:
+                    return False, "password_min_length must be between 8 and 32"
+                clean_val = str(num)
+            except (TypeError, ValueError):
+                return False, "password_min_length must be a valid integer"
+        elif key == "mfa_required":
+            clean_val = "true" if str(val).strip().lower() in ("true", "1", "yes") else "false"
+        else:
+            clean_val = str(val).strip()[:100]
+
+        res = execute_query(
+            """
+            INSERT INTO admin_settings (setting_key, setting_value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (setting_key) DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_at = NOW()
+            """,
+            (key, clean_val)
         )
+        if isinstance(res, str) and res.startswith("Error"):
+            return False, res
         updated.append(key)
     return bool(updated), f"Updated: {', '.join(updated)}" if updated else "No valid settings updated"
 
