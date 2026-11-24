@@ -1,111 +1,91 @@
-def send_otp_email(to_email, otp_code, username=None):
-    """Send an OTP email using SMTP (Gmail, Outlook, custom) or Plunk email delivery.
+"""Transactional email delivery for VaultAuth SSO via SMTP (TLS/SSL) and Plunk."""
 
-    Reads configuration from environment variables:
-    - ``SMTP_EMAIL`` / ``SMTP_PASSWORD``: Direct SMTP credentials (e.g., Gmail App Password).
-    - ``SMTP_HOST`` / ``SMTP_PORT``: SMTP host (default: ``smtp.gmail.com``) and port (default: ``587``).
-    - ``PLUNK_API_KEY``: API key for Plunk email delivery service.
-    - ``PLUNK_FROM``: Sender address for Plunk (e.g., ``Vault Auth <no-reply@vaultauthsso.proplays2312.eu.org>``).
+import email.utils
+import html
+import json
+import os
+import smtplib
+import urllib.error
+import urllib.request
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-    Returns:
-        tuple[bool, Optional[str]]: (True, None) on success, or (False, error_message) on failure.
-    """
-    import os
-    import json
-    import html
-    import email.utils
-    import urllib.request
-    import urllib.error
-    from api.utils import safe_print
+from api.utils import safe_print
 
-    smtp_user = os.getenv("SMTP_EMAIL") or os.getenv("SMTP_USER") or os.getenv("GMAIL_USER")
-    smtp_pass = os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_APP_PASSWORD") or os.getenv("SMTP_PASS") or os.getenv("GMAIL_APP_PASSWORD")
-    plunk_key = os.getenv("PLUNK_API_KEY")
 
-    if not (smtp_user and smtp_pass) and not (plunk_key and plunk_key.strip()):
-        return False, "Email delivery not configured. Add SMTP_EMAIL + SMTP_PASSWORD or PLUNK_API_KEY to .env."
+def _get_smtp_config():
+    """Read SMTP settings cleanly from environment variables without logging secrets."""
+    smtp_user = (
+        os.getenv("SMTP_EMAIL")
+        or os.getenv("SMTP_USER")
+        or os.getenv("GMAIL_USER")
+        or ""
+    ).strip()
+    smtp_pass = (
+        os.getenv("SMTP_PASSWORD")
+        or os.getenv("SMTP_APP_PASSWORD")
+        or os.getenv("SMTP_PASS")
+        or os.getenv("GMAIL_APP_PASSWORD")
+        or ""
+    ).strip()
+    smtp_host = (os.getenv("SMTP_HOST") or "smtp.gmail.com").strip()
+    port_raw = (os.getenv("SMTP_PORT") or "587").strip()
+    smtp_port = int(port_raw) if port_raw.isdigit() else 587
+    use_tls_raw = os.getenv("SMTP_USE_TLS", "true").strip().lower()
+    smtp_use_tls = use_tls_raw in ("true", "1", "yes", "on")
+    smtp_from = (os.getenv("SMTP_FROM") or f"VaultAuth SSO <{smtp_user}>").strip()
+    return {
+        "user": smtp_user,
+        "password": smtp_pass,
+        "host": smtp_host,
+        "port": smtp_port,
+        "use_tls": smtp_use_tls,
+        "from": smtp_from,
+    }
 
-    raw_display = username or to_email
-    display_name = html.escape(str(raw_display))
-    safe_otp = html.escape(str(otp_code))
-    subject = f"{otp_code} is your Vault Auth verification code"
 
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset=\"utf-8\"/>
-  <style>
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-      background-color: #0f172a;
-      color: #f8fafc;
-      margin: 0;
-      padding: 30px;
-    }}
-    .container {{ max-width: 500px; margin: 0 auto; background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 32px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
-    .header {{ text-align: center; margin-bottom: 24px; }}
-    .brand {{ font-size: 24px; font-weight: 700; letter-spacing: -0.5px; color: #38bdf8; }}
-    .title {{ font-size: 18px; color: #e2e8f0; margin-top: 8px; font-weight: 600; }}
-    .otp-box {{ margin: 28px 0; text-align: center; background: #0f172a; border: 2px dashed #38bdf8; border-radius: 10px; padding: 18px; }}
-    .otp-code {{ font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #38bdf8; font-family: 'SF Mono', Consolas, Monaco, monospace; }}
-    .info {{ font-size: 14px; color: #94a3b8; line-height: 1.6; margin-top: 16px; }}
-    .footer {{ margin-top: 28px; padding-top: 16px; border-top: 1px solid #334155; font-size: 12px; color: #64748b; text-align: center; }}
-  </style>
-</head>
-<body>
-  <div class=\"container\">
-    <div class=\"header\">
-      <div class=\"brand\">Vault Auth</div>
-      <div class=\"title\">Verification Code</div>
-    </div>
-    <p class=\"info\">Hello <strong>{display_name}</strong>,</p>
-    <p class=\"info\">Use the following One-Time Password (OTP) to complete your login. This code is confidential and valid for <strong>5 minutes</strong>.</p>
-    <div class=\"otp-box\"><div class=\"otp-code\">{safe_otp}</div></div>
-    <p class=\"info\">If you didn't request this login code, you can safely ignore this email.</p>
-    <div class=\"footer\">&copy; Vault Auth Security &bull; Automated security notification</div>
-  </div>
-</body>
-</html>
-"""
+def _send_via_smtp(cfg, to_email, subject, html_content, text_content, context_label):
+    """Send email over SMTP supporting STARTTLS (587) and implicit SSL (465)."""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = cfg["from"]
+    msg["To"] = to_email
+    msg.attach(MIMEText(text_content, "plain", "utf-8"))
+    msg.attach(MIMEText(html_content, "html", "utf-8"))
 
-    # 1. SMTP Delivery (if SMTP credentials are provided)
-    if smtp_user and smtp_pass:
-        import smtplib
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
-
-        smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        smtp_port = int(os.getenv("SMTP_PORT", "587") or 587)
-        from_header = os.getenv("SMTP_FROM", f"Vault Auth <{smtp_user}>")
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = from_header
-        msg["To"] = to_email
-
-        text_content = f"Vault Auth - Verification Code\n\nHello {raw_display},\n\nYour login verification code is: {otp_code}\n\nThis code is valid for 5 minutes.\nIf you did not request this, please ignore this email."
-        msg.attach(MIMEText(text_content, "plain"))
-        msg.attach(MIMEText(html_content, "html"))
-
-        try:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
+    try:
+        if cfg["port"] == 465:
+            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=10) as server:
                 server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(smtp_user, smtp_pass)
+                server.login(cfg["user"], cfg["password"])
                 server.send_message(msg)
-            safe_print(f"[SMTP Success] OTP email sent to {to_email}")
-            return True, None
-        except Exception as e:
-            safe_print(f"[SMTP Error] {e}")
-            if not plunk_key:
-                return False, f"SMTP delivery failed: {e}"
+        else:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=10) as server:
+                server.ehlo()
+                if cfg["use_tls"]:
+                    server.starttls()
+                    server.ehlo()
+                server.login(cfg["user"], cfg["password"])
+                server.send_message(msg)
+        safe_print(f"[SMTP Success] {context_label} email dispatched")
+        return True, None
+    except smtplib.SMTPAuthenticationError:
+        safe_print(f"[SMTP Error] Authentication failed while sending {context_label} email")
+        return False, "SMTP authentication failed. Please verify SMTP_EMAIL and SMTP_PASSWORD."
+    except Exception as e:
+        safe_print(f"[SMTP Error] Failed to send {context_label} email: {e}")
+        return False, f"SMTP delivery failed: {e}"
 
-    # 2. Plunk API Delivery (fallback or primary when PLUNK_API_KEY is set)
-    plunk_from = os.getenv("PLUNK_FROM", "Vault Auth <no-reply@vaultauthsso.proplays2312.eu.org>")
+
+def _send_via_plunk(plunk_key, to_email, subject, html_content, context_label):
+    """Send email using Plunk REST API as fallback provider."""
+    plunk_from = os.getenv(
+        "PLUNK_FROM",
+        "VaultAuth SSO <no-reply@vaultauthsso.proplays2312.eu.org>",
+    )
     sender_name, sender_addr = email.utils.parseaddr(plunk_from)
     sender_addr = sender_addr.strip() if sender_addr else plunk_from.strip()
-    sender_name = sender_name.strip() if sender_name else "Vault Auth"
+    sender_name = sender_name.strip() if sender_name else "VaultAuth SSO"
 
     payload = {
         "to": to_email,
@@ -127,8 +107,8 @@ def send_otp_email(to_email, otp_code, username=None):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            safe_print(f"[Plunk] OTP email successfully sent to {to_email}")
+        with urllib.request.urlopen(req, timeout=10):
+            safe_print(f"[Plunk Success] {context_label} email dispatched")
             return True, None
     except urllib.error.HTTPError as e:
         try:
@@ -146,32 +126,32 @@ def send_otp_email(to_email, otp_code, username=None):
         return False, f"Plunk dispatch failed: {e}"
 
 
-def send_password_reset_email(to_email, reset_code_or_link, username=None):
-    """Send a password reset instructions email using SMTP or Plunk."""
-    import os
-    import json
-    import html
-    import email.utils
-    import urllib.request
-    import urllib.error
-    from api.utils import safe_print
+def _dispatch_email(to_email, subject, html_content, text_content, context_label):
+    """Dispatch email via SMTP if configured, otherwise Plunk API."""
+    smtp_cfg = _get_smtp_config()
+    if smtp_cfg["user"] and smtp_cfg["password"]:
+        return _send_via_smtp(
+            smtp_cfg, to_email, subject, html_content, text_content, context_label
+        )
 
-    smtp_user = os.getenv("SMTP_EMAIL") or os.getenv("SMTP_USER") or os.getenv("GMAIL_USER")
-    smtp_pass = os.getenv("SMTP_PASSWORD") or os.getenv("SMTP_APP_PASSWORD") or os.getenv("SMTP_PASS") or os.getenv("GMAIL_APP_PASSWORD")
-    plunk_key = os.getenv("PLUNK_API_KEY")
+    plunk_key = (os.getenv("PLUNK_API_KEY") or "").strip()
+    if plunk_key:
+        return _send_via_plunk(
+            plunk_key, to_email, subject, html_content, context_label
+        )
 
-    if not (smtp_user and smtp_pass) and not (plunk_key and plunk_key.strip()):
-        return False, "Email delivery not configured. Add SMTP_EMAIL + SMTP_PASSWORD or PLUNK_API_KEY to .env."
+    return False, (
+        "Email delivery not configured. Add SMTP_EMAIL and SMTP_PASSWORD "
+        "(or PLUNK_API_KEY) to .env."
+    )
 
-    raw_display = username or to_email
-    display_name = html.escape(str(raw_display))
-    safe_code = html.escape(str(reset_code_or_link))
-    subject = "Vault Auth Password Reset Request"
 
-    html_content = f"""<!DOCTYPE html>
+def _render_otp_email_html(title, display_name, intro_text, safe_code, expiry_minutes, warning_text):
+    """Render a branded VaultAuth SSO transactional security email."""
+    return f"""<!DOCTYPE html>
 <html>
 <head>
-  <meta charset=\"utf-8\"/>
+  <meta charset="utf-8"/>
   <style>
     body {{
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -180,95 +160,80 @@ def send_password_reset_email(to_email, reset_code_or_link, username=None):
       margin: 0;
       padding: 30px;
     }}
-    .container {{ max-width: 500px; margin: 0 auto; background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 32px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }}
+    .container {{ max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 32px; box-shadow: 0 10px 25px rgba(0,0,0,0.45); }}
     .header {{ text-align: center; margin-bottom: 24px; }}
     .brand {{ font-size: 24px; font-weight: 700; letter-spacing: -0.5px; color: #38bdf8; }}
     .title {{ font-size: 18px; color: #e2e8f0; margin-top: 8px; font-weight: 600; }}
-    .code-box {{ margin: 28px 0; text-align: center; background: #0f172a; border: 2px dashed #38bdf8; border-radius: 10px; padding: 18px; }}
-    .code-text {{ font-size: 32px; font-weight: 800; letter-spacing: 6px; color: #38bdf8; font-family: 'SF Mono', Consolas, Monaco, monospace; }}
-    .info {{ font-size: 14px; color: #94a3b8; line-height: 1.6; margin-top: 16px; }}
-    .footer {{ margin-top: 28px; padding-top: 16px; border-top: 1px solid #334155; font-size: 12px; color: #64748b; text-align: center; }}
+    .otp-box {{ margin: 26px 0; text-align: center; background: #0f172a; border: 2px dashed #38bdf8; border-radius: 10px; padding: 18px; }}
+    .otp-code {{ font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #38bdf8; font-family: 'SF Mono', Consolas, Monaco, monospace; }}
+    .info {{ font-size: 14px; color: #cbd5e1; line-height: 1.6; margin-top: 14px; }}
+    .warning {{ margin-top: 20px; padding: 12px 14px; background: rgba(245, 158, 11, 0.12); border-left: 3px solid #f59e0b; border-radius: 6px; font-size: 13px; color: #fde68a; line-height: 1.5; }}
+    .footer {{ margin-top: 28px; padding-top: 16px; border-top: 1px solid #334155; font-size: 12px; color: #94a3b8; text-align: center; }}
   </style>
 </head>
 <body>
-  <div class=\"container\">
-    <div class=\"header\">
-      <div class=\"brand\">Vault Auth</div>
-      <div class=\"title\">Password Reset Request</div>
+  <div class="container">
+    <div class="header">
+      <div class="brand">VaultAuth SSO</div>
+      <div class="title">{title}</div>
     </div>
-    <p class=\"info\">Hello <strong>{display_name}</strong>,</p>
-    <p class=\"info\">We received a request to reset your password. Use the verification code below to reset your password. This code will expire in <strong>15 minutes</strong>.</p>
-    <div class=\"code-box\"><div class=\"code-text\">{safe_code}</div></div>
-    <p class=\"info\">If you did not request a password reset, you can safely disregard this email. Your password will remain unchanged.</p>
-    <div class=\"footer\">&copy; Vault Auth Security &bull; Automated security notification</div>
+    <p class="info">Hello <strong>{display_name}</strong>,</p>
+    <p class="info">{intro_text} This code will expire in <strong>{expiry_minutes} minutes</strong>.</p>
+    <div class="otp-box"><div class="otp-code">{safe_code}</div></div>
+    <div class="warning">{warning_text}</div>
+    <div class="footer">&copy; VaultAuth SSO Security &bull; Automated identity protection notice</div>
   </div>
 </body>
 </html>
 """
 
-    # 1. SMTP Delivery
-    if smtp_user and smtp_pass:
-        import smtplib
-        from email.mime.multipart import MIMEMultipart
-        from email.mime.text import MIMEText
 
-        smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        smtp_port = int(os.getenv("SMTP_PORT", "587") or 587)
-        from_header = os.getenv("SMTP_FROM", f"Vault Auth <{smtp_user}>")
+def send_otp_email(to_email, otp_code, username=None):
+    """Send a login verification OTP email via SMTP or Plunk."""
+    raw_display = username or to_email
+    display_name = html.escape(str(raw_display))
+    safe_otp = html.escape(str(otp_code))
+    subject = f"{otp_code} is your Vault Auth verification code"
 
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = from_header
-        msg["To"] = to_email
-
-        text_content = f"Vault Auth - Password Reset\n\nHello {raw_display},\n\nYour password reset code is: {reset_code_or_link}\nValid for 15 minutes."
-        msg.attach(MIMEText(text_content, "plain"))
-        msg.attach(MIMEText(html_content, "html"))
-
-        try:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(smtp_user, smtp_pass)
-                server.send_message(msg)
-            safe_print(f"[SMTP Success] Password reset email sent to {to_email}")
-            return True, None
-        except Exception as e:
-            safe_print(f"[SMTP Error] {e}")
-            if not plunk_key:
-                return False, f"SMTP delivery failed: {e}"
-
-    # 2. Plunk Delivery
-    plunk_from = os.getenv("PLUNK_FROM", "Vault Auth <no-reply@vaultauthsso.proplays2312.eu.org>")
-    sender_name, sender_addr = email.utils.parseaddr(plunk_from)
-    sender_addr = sender_addr.strip() if sender_addr else plunk_from.strip()
-    sender_name = sender_name.strip() if sender_name else "Vault Auth"
-
-    payload = {
-        "to": to_email,
-        "subject": subject,
-        "body": html_content,
-        "from": sender_addr,
-        "name": sender_name,
-    }
-
-    req = urllib.request.Request(
-        "https://next-api.useplunk.com/v1/send",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {plunk_key.strip()}",
-            "Content-Type": "application/json",
-            "User-Agent": "VaultAuth/1.0",
-        },
-        method="POST",
+    html_content = _render_otp_email_html(
+        title="Login Verification Code",
+        display_name=display_name,
+        intro_text="Use the following One-Time Password (OTP) to complete your login.",
+        safe_code=safe_otp,
+        expiry_minutes=5,
+        warning_text="If you did not request this login verification code, please ignore this email and ensure your account password is secure.",
     )
+    text_content = (
+        f"VaultAuth SSO - Verification Code\n\n"
+        f"Hello {raw_display},\n\n"
+        f"Your login verification code is: {otp_code}\n\n"
+        f"This code is valid for 5 minutes.\n"
+        f"If you did not request this, please ignore this email."
+    )
+    return _dispatch_email(to_email, subject, html_content, text_content, "OTP")
 
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            safe_print(f"[Plunk] Password reset email sent to {to_email}")
-            return True, None
-    except Exception as e:
-        safe_print(f"[Plunk Error] Password reset send failed: {e}")
-        return False, str(e)
 
+def send_password_reset_email(to_email, otp_code, username=None):
+    """Send a password reset verification OTP email via SMTP or Plunk."""
+    raw_display = username or to_email
+    display_name = html.escape(str(raw_display))
+    safe_otp = html.escape(str(otp_code))
+    subject = "VaultAuth SSO – Password Reset Verification"
+
+    html_content = _render_otp_email_html(
+        title="Password Reset Verification",
+        display_name=display_name,
+        intro_text="We received a request to reset your VaultAuth SSO password. Enter the verification code below to continue.",
+        safe_code=safe_otp,
+        expiry_minutes=5,
+        warning_text="Security Warning: If you did not request a password reset, do NOT share this code with anyone. Your password remains unchanged unless you verify this code.",
+    )
+    text_content = (
+        f"VaultAuth SSO – Password Reset Verification\n\n"
+        f"Hello {raw_display},\n\n"
+        f"Your password reset verification OTP is: {otp_code}\n"
+        f"This code will expire in 5 minutes.\n\n"
+        f"Security Warning: If you did not request this password reset, you can safely ignore this email "
+        f"and review your account security settings."
+    )
+    return _dispatch_email(to_email, subject, html_content, text_content, "Password Reset")

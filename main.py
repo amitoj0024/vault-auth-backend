@@ -63,6 +63,12 @@ from api.webauthn_service import (
     get_user_passkeys,
     delete_user_passkey,
 )
+from api.password_reset import (
+    request_password_reset,
+    verify_reset_otp as verify_password_reset_otp,
+    complete_password_reset,
+)
+from api.reset_db import init_reset_db
 from flask import g
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
@@ -216,7 +222,10 @@ def login():
     if data is None:
         return jsonify({"message": "Data is null"}), 400
 
-    login_identifier = data.get("login") or data.get("username")
+    raw_login = data.get("login") or data.get("username") or data.get("email") or ""
+    login_identifier = str(raw_login).strip()
+    if "@" in login_identifier:
+        login_identifier = login_identifier.lower()
     password = data.get("password")
     if not login_identifier or not password:
         return jsonify({"message": "User not found"}), 404
@@ -224,6 +233,7 @@ def login():
     try:
         result = auth_user(login_identifier, password)
         if not result or (isinstance(result, str) and result.startswith("Error")):
+            user_rec = None
             try:
                 user_rec = get_users(login_identifier)
                 if user_rec and len(user_rec) > 0:
@@ -231,20 +241,33 @@ def login():
             except Exception:
                 pass
             log_security_event("LOGIN_FAILED", details=f"identifier={login_identifier}")
+            if user_rec and len(user_rec) > 0:
+                if user_rec[0].get("is_active") is False:
+                    return jsonify({"message": "Account is deactivated. Please contact your administrator."}), 403
+                return jsonify({"message": "Invalid email or password. Passwords are case-sensitive."}), 401
             return jsonify({"message": "User not found"}), 404
     except Exception as e:
         safe_print(f"Login error: {e}")
         return jsonify({"message": f"Error: {e}"}), 500
 
     try:
+        email_val = None
+        full_name_val = None
+        role_val = "user"
         if isinstance(result, dict):
             uid = result.get("uid") or result.get("id") or 0
             user = result.get("username") or result.get("user") or login_identifier
+            email_val = result.get("email")
+            full_name_val = result.get("full_name")
+            role_val = result.get("role") or "user"
         else:
             user_record = get_users(login_identifier)
             if user_record and len(user_record) > 0 and isinstance(user_record[0], dict):
                 uid = user_record[0].get("uid") or user_record[0].get("id") or 0
                 user = user_record[0].get("username") or user_record[0].get("user") or login_identifier
+                email_val = user_record[0].get("email")
+                full_name_val = user_record[0].get("full_name")
+                role_val = user_record[0].get("role") or "user"
             else:
                 uid = 0
                 user = login_identifier
@@ -264,7 +287,17 @@ def login():
             safe_print(f"Session tracking notice: {e}")
 
         log_security_event("LOGIN_SUCCESS", uid=uid, details=f"username={user}")
-        response = jsonify({"message": "Login successful", "token": s_token})
+        response = jsonify({
+            "message": "Login successful",
+            "token": s_token,
+            "user": {
+                "uid": uid,
+                "username": user,
+                "email": email_val,
+                "full_name": full_name_val,
+                "role": role_val,
+            },
+        })
         response.set_cookie(
             "token",
             s_token,
@@ -358,71 +391,67 @@ def send_otp():
 @app.route("/api/auth/forgot-password", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=60, key_prefix="forgot_pw")
 def forgot_password():
-    data = request.get_json() if request.is_json else {}
+    data = request.get_json(silent=True) or {}
     email = data.get("email") or data.get("identifier") or data.get("login")
     if not email:
         return jsonify({"message": "Email address is required", "success": False}), 400
 
-    email = str(email).strip().lower()
-    user_rec = get_users(email)
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+    payload, _, status = request_password_reset(email, client_ip=client_ip, enforce_cooldown=False)
+    return jsonify(payload), status
 
-    success_resp = {
-        "success": True,
-        "message": f"If an account with {email} exists, password reset instructions have been sent."
-    }
 
-    if not user_rec or len(user_rec) == 0:
-        return jsonify(success_resp), 200
+@app.route("/api/auth/resend-reset-otp", methods=["POST"])
+@rate_limit(max_requests=10, window_seconds=60, key_prefix="resend_reset_otp")
+def resend_reset_otp():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email") or data.get("identifier") or data.get("login")
+    if not email:
+        return jsonify({"message": "Email address is required", "success": False}), 400
 
-    user = user_rec[0]
-    if user.get("is_active") is False:
-        return jsonify(success_resp), 200
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+    payload, _, status = request_password_reset(email, client_ip=client_ip, enforce_cooldown=True)
+    return jsonify(payload), status
 
-    otp_info, err = create_otp(email)
-    if err:
-        safe_print(f"[ForgotPassword Notice]: {err}")
 
-    log_security_event("PASSWORD_RESET_REQUEST", uid=user.get("uid"), details=f"email={email}")
-    return jsonify(success_resp), 200
+@app.route("/api/auth/verify-reset-otp", methods=["POST"])
+@rate_limit(max_requests=15, window_seconds=60, key_prefix="verify_reset_otp")
+def verify_reset_otp_endpoint():
+    data = request.get_json(silent=True) or {}
+    email = data.get("email") or data.get("identifier")
+    otp_code = data.get("otp") or data.get("code") or data.get("otp_code")
+
+    if not email or not otp_code:
+        return jsonify({"message": "Email and verification code are required", "success": False}), 400
+
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+    payload, _, status = verify_password_reset_otp(email, otp_code, client_ip=client_ip)
+    return jsonify(payload), status
 
 
 @app.route("/api/reset-password", methods=["POST"])
 @app.route("/api/auth/reset-password", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=60, key_prefix="reset_pw")
 def reset_password():
-    data = request.get_json() if request.is_json else {}
-    email = data.get("email") or data.get("identifier")
-    otp_code = data.get("otp") or data.get("code")
-    new_password = data.get("password") or data.get("new_password")
+    data = request.get_json(silent=True) or {}
+    reset_token = data.get("reset_token") or data.get("token")
+    new_password = data.get("new_password") or data.get("password")
+    confirm_password = data.get("confirm_password") or data.get("confirmPassword")
 
-    if not email or not otp_code or not new_password:
-        return jsonify({"message": "Email, verification code, and new password are required", "success": False}), 400
+    if not reset_token or not new_password:
+        return jsonify({
+            "message": "Reset authorization token and new password are required",
+            "success": False,
+        }), 400
 
-    is_valid, msg = validate_password_strength(new_password)
-    if not is_valid:
-        return jsonify({"message": msg, "success": False}), 400
-
-    verified, v_err = verify_otp(email, otp_code)
-    if not verified:
-        return jsonify({"message": v_err or "Invalid or expired verification code", "success": False}), 400
-
-    try:
-        from werkzeug.security import generate_password_hash
-        hashed = generate_password_hash(new_password)
-        res = execute_query("UPDATE users SET password = %s WHERE email = %s OR username = %s", (hashed, email, email))
-        if isinstance(res, str) and res.startswith("Error:"):
-            return jsonify({"message": "Database update failed", "success": False}), 500
-
-        user_rec = get_users(email)
-        uid = user_rec[0].get("uid") if user_rec else 0
-        if uid:
-            execute_query("UPDATE active_sessions SET is_active = FALSE, revoked_at = NOW() WHERE uid = %s", (uid,))
-
-        log_security_event("PASSWORD_RESET_SUCCESS", uid=uid, details=f"email={email}")
-        return jsonify({"message": "Password successfully reset. Please log in with your new password.", "success": True}), 200
-    except Exception as e:
-        safe_print(f"[Password Reset Error]: {e}")
-        return jsonify({"message": "Password reset failed. Please try again.", "success": False}), 500
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1").split(",")[0].strip()
+    payload, _, status = complete_password_reset(
+        reset_token,
+        new_password,
+        confirm_password=confirm_password,
+        client_ip=client_ip,
+    )
+    return jsonify(payload), status
 
 
 
@@ -1281,6 +1310,7 @@ def init_app_database():
         init_dashboard_db()
         init_admin_db()
         init_webauthn_db()
+        init_reset_db()
     except Exception as e:
         safe_print(f"Database init warning: {e}")
 

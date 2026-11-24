@@ -14,7 +14,7 @@ load_dotenv()
 
 
 def auth_user(login, password):
-    query = "SELECT uid, username, email, full_name, password, is_active FROM users WHERE username = %s OR email = %s"
+    query = "SELECT uid, username, email, full_name, password, is_active, role FROM users WHERE username = %s OR email = %s"
     try:
         result = execute_query(query, (login, login))
         if isinstance(result, list) and len(result) > 0:
@@ -41,7 +41,8 @@ def auth_user(login, password):
                     "uid": user.get("uid"),
                     "username": user.get("username"),
                     "email": user.get("email"),
-                    "full_name": user.get("full_name")
+                    "full_name": user.get("full_name"),
+                    "role": user.get("role") or "user",
                 }
         return None
     except Exception as e:

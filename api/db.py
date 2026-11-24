@@ -1,5 +1,6 @@
 # Description: This file contains the database connection function.
 
+from contextlib import contextmanager
 import psycopg2
 import psycopg2.extras
 import os
@@ -68,3 +69,23 @@ def execute_query(query, params=None):
             connection.close()
     else:
         raise Exception("Error connecting to database")
+
+
+@contextmanager
+def db_transaction():
+    """Context manager yielding a psycopg2 cursor wrapped in an atomic DB transaction."""
+    connection = get_connection()
+    if connection is None:
+        raise Exception("Error connecting to database")
+    try:
+        with connection.cursor() as cursor:
+            yield cursor
+        connection.commit()
+    except Exception:
+        try:
+            connection.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        connection.close()

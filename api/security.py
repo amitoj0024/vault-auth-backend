@@ -33,6 +33,7 @@ def log_security_event(event_type, uid=None, ip=None, details=None):
         r'(?i)(password[\s:=]+)\S+',
         r'(?i)(otp[\s:=]+)\d+',
         r'(?i)(code[\s:=]+)\d{4,8}',
+        r'(?i)(reset_token[\s:=]+)\S+',
         r'(?i)(token[\s:=]+)[A-Za-z0-9_\-\.]{16,}',
         r'(?i)(secret[\s:=]+)\S+'
     ]:
@@ -194,6 +195,40 @@ def validate_password_strength(password):
     else:
         strength = "Weak"
 
+    return True, strength, []
+
+
+def validate_reset_password(password):
+    """
+    Enforce strict password complexity rules for password reset:
+    - Minimum 8 characters
+    - At least one uppercase letter
+    - At least one lowercase letter
+    - At least one digit
+    - At least one special character
+    Returns: (is_valid: bool, strength: str, errors: list[str])
+    """
+    if not password or not isinstance(password, str):
+        return False, "Weak", ["Password cannot be empty."]
+
+    errors = []
+    if len(password) < 8:
+        errors.append("Password must be at least 8 characters long.")
+    if not re.search(r'[A-Z]', password):
+        errors.append("Password must include at least one uppercase letter.")
+    if not re.search(r'[a-z]', password):
+        errors.append("Password must include at least one lowercase letter.")
+    if not re.search(r'\d', password):
+        errors.append("Password must include at least one number.")
+    if not re.search(r'[^A-Za-z0-9\s]', password):
+        errors.append("Password must include at least one special character.")
+    if password.lower() in _COMMON_WEAK_PASSWORDS:
+        errors.append("Password is too common and easily guessed.")
+
+    if errors:
+        return False, "Weak", errors
+
+    _, strength, _ = validate_password_strength(password)
     return True, strength, []
 
 
