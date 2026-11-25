@@ -69,7 +69,13 @@ def test_admin_connected_apps_aggregation_live(client, admin_headers, monkeypatc
             "is_active": False,
         },
     ]
-    monkeypatch.setattr(admin, "execute_query", lambda q, p=None: sample_rows)
+    queries_seen = []
+
+    def fake_apps_query(q, p=None):
+        queries_seen.append(q)
+        return sample_rows
+
+    monkeypatch.setattr(admin, "execute_query", fake_apps_query)
 
     res = client.get("/api/admin/connected-apps", headers=headers)
     assert res.status_code == 200
@@ -83,6 +89,8 @@ def test_admin_connected_apps_aggregation_live(client, admin_headers, monkeypatc
     assert vault_app["app_key"] == "vaultauth"
     assert vault_app["total_logins"] == 4
     assert vault_app["connected_emails"] == ["amy492998@gmail.com"]
+    assert vault_app["connected_users"][0]["full_name"] == "amy"
+    assert any("vaultauth\\.test" in q for q in queries_seen)
 
 
 def test_admin_toggle_connected_app_endpoint(client, admin_headers, monkeypatch):
@@ -162,10 +170,11 @@ def test_session_expiration_and_cleanup_align_on_utc(monkeypatch):
     cleanup_cutoffs = []
 
     def fake_exec(q, p=None):
-        if "INSERT INTO active_sessions" in q and p and len(p) >= 10:
+        norm = " ".join(str(q).split())
+        if "INSERT INTO active_sessions" in norm and p and len(p) >= 10:
             inserted_exp.append(p[9])
-        elif "UPDATE active_sessions SET is_active = FALSE" in q and p:
-            cleanup_cutoffs.append(p[-1])
+        elif "UPDATE active_sessions SET is_active = FALSE" in norm and p and len(p) >= 2:
+            cleanup_cutoffs.append(p[1])
         return ()
 
     class FakeHeaders(dict):
@@ -185,3 +194,115 @@ def test_session_expiration_and_cleanup_align_on_utc(monkeypatch):
     assert len(inserted_exp) == 1
     assert len(cleanup_cutoffs) == 1
     assert inserted_exp[0] > cleanup_cutoffs[0]
+
+
+def test_security_activity_groups_same_uid_and_minute(monkeypatch):
+    import api.admin as admin
+    from datetime import datetime
+
+    queries = []
+    t_same_1 = datetime(2026, 11, 25, 17, 40, 41)
+    t_same_2 = datetime(2026, 11, 25, 17, 40, 12)
+    t_other_min = datetime(2026, 11, 25, 17, 39, 55)
+    bucket_40 = datetime(2026, 11, 25, 17, 40, 0)
+    bucket_39 = datetime(2026, 11, 25, 17, 39, 0)
+
+    def fake_login_query(q, p=None):
+        norm = " ".join(str(q).split())
+        queries.append(norm)
+        if "SELECT COUNT(*) AS cnt" in norm:
+            return [{"cnt": 3, "raw_cnt": 4}]
+        if "FROM filtered f" in norm:
+            return [
+                {
+                    "id": 121, "uid": 24, "username": "amy", "full_name": "Amy Admin",
+                    "email": "amy492998@gmail.com", "device_name": "MacBook Pro",
+                    "device_type": "laptop", "browser": "Chrome", "os": "macOS",
+                    "location": "Local", "ip_address": "127.0.0.1", "status": "Success",
+                    "created_at": t_same_1, "time_bucket": bucket_40,
+                },
+                {
+                    "id": 120, "uid": 24, "username": "amy", "full_name": "Amy Admin",
+                    "email": "amy492998@gmail.com", "device_name": "MacBook Pro",
+                    "device_type": "laptop", "browser": "Chrome", "os": "macOS",
+                    "location": "Local", "ip_address": "127.0.0.1", "status": "Failed",
+                    "created_at": t_same_2, "time_bucket": bucket_40,
+                },
+                {
+                    "id": 119, "uid": 5, "username": "amitoj", "full_name": "Amitoj",
+                    "email": "amitoj0024@gmail.com", "device_name": "MacBook Pro",
+                    "device_type": "laptop", "browser": "Chrome", "os": "macOS",
+                    "location": "Local", "ip_address": "127.0.0.1", "status": "Success",
+                    "created_at": t_same_2, "time_bucket": bucket_40,
+                },
+                {
+                    "id": 118, "uid": 24, "username": "amy", "full_name": "Amy Admin",
+                    "email": "amy492998@gmail.com", "device_name": "MacBook Pro",
+                    "device_type": "laptop", "browser": "Chrome", "os": "macOS",
+                    "location": "Local", "ip_address": "127.0.0.1", "status": "Success",
+                    "created_at": t_other_min, "time_bucket": bucket_39,
+                },
+            ]
+        return ()
+
+    monkeypatch.setattr(admin, "execute_query", fake_login_query)
+    res = admin.get_admin_login_activity(page=1, per_page=25)
+    assert res["total"] == 3
+    assert res["raw_total"] == 4
+    assert len(res["activities"]) == 3
+    first = res["activities"][0]
+    assert first["uid"] == 24
+    assert first["event_count"] == 2
+    assert first["has_failure"] is True
+    assert first["status_counts"] == {"Success": 1, "Failed": 1}
+    assert [e["id"] for e in first["events"]] == [121, 120]
+    assert res["activities"][1]["uid"] == 5 and res["activities"][1]["event_count"] == 1
+    assert res["activities"][2]["uid"] == 24 and res["activities"][2]["event_count"] == 1
+    assert any("DATE_TRUNC('minute', la.created_at)" in q for q in queries)
+
+    audit_queries = []
+
+    def fake_audit_query(q, p=None):
+        norm = " ".join(str(q).split())
+        audit_queries.append(norm)
+        if "SELECT COUNT(*) AS cnt" in norm:
+            return [{"cnt": 1, "raw_cnt": 3}]
+        if "FROM filtered f" in norm:
+            return [
+                {
+                    "id": 462, "event_type": "ADMIN_STATS_VIEW", "actor_uid": 24,
+                    "actor_username": "amy", "full_name": "Amy Admin", "user_username": "amy",
+                    "target_uid": None, "target_username": None, "ip_address": "127.0.0.1",
+                    "status": "Success", "details": None, "created_at": t_same_1,
+                    "group_uid": 24, "time_bucket": bucket_40,
+                },
+                {
+                    "id": 461, "event_type": "ADMIN_APP_ENABLED", "actor_uid": 24,
+                    "actor_username": "amy", "full_name": "Amy Admin", "user_username": "amy",
+                    "target_uid": None, "target_username": None, "ip_address": "127.0.0.1",
+                    "status": "Success", "details": "app_key=github", "created_at": t_same_2,
+                    "group_uid": 24, "time_bucket": bucket_40,
+                },
+                {
+                    "id": 460, "event_type": "ADMIN_STATS_VIEW", "actor_uid": 24,
+                    "actor_username": "amy", "full_name": "Amy Admin", "user_username": "amy",
+                    "target_uid": None, "target_username": None, "ip_address": "127.0.0.1",
+                    "status": "Success", "details": None, "created_at": t_same_2,
+                    "group_uid": 24, "time_bucket": bucket_40,
+                },
+            ]
+        return ()
+
+    monkeypatch.setattr(admin, "execute_query", fake_audit_query)
+    ares = admin.get_audit_logs(page=1, per_page=25)
+    assert ares["total"] == 1
+    assert ares["raw_total"] == 3
+    assert len(ares["logs"]) == 1
+    grp = ares["logs"][0]
+    assert grp["uid"] == 24
+    assert grp["event_count"] == 3
+    assert grp["event_types"] == [
+        {"event_type": "ADMIN_STATS_VIEW", "count": 2},
+        {"event_type": "ADMIN_APP_ENABLED", "count": 1},
+    ]
+    assert any("DATE_TRUNC('minute', al.created_at)" in q for q in audit_queries)

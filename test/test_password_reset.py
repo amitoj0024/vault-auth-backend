@@ -286,6 +286,7 @@ def reset_env(monkeypatch):
     monkeypatch.setattr("main.record_login_activity", lambda *args, **kwargs: None)
     monkeypatch.setattr("main.create_user_session", lambda *args, **kwargs: None)
     monkeypatch.setattr("main.ensure_default_user_dashboard_data", lambda *args, **kwargs: None)
+    monkeypatch.setattr("main.record_connected_app_signin", lambda *args, **kwargs: None)
 
     return db, sent_emails
 

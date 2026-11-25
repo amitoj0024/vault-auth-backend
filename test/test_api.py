@@ -338,6 +338,7 @@ def test_verify_otp_endpoint_includes_user_role(client, monkeypatch):
     monkeypatch.setattr("main.record_login_activity", lambda *a, **k: None)
     monkeypatch.setattr("main.create_user_session", lambda *a, **k: None)
     monkeypatch.setattr("main.ensure_default_user_dashboard_data", lambda *a, **k: None)
+    monkeypatch.setattr("main.record_connected_app_signin", lambda *a, **k: None)
 
     res = client.post("/api/otp/verify", json={"identifier": "admin_alice", "otp": "654321"})
     assert res.status_code == 200

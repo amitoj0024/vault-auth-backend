@@ -23,6 +23,7 @@ def auth_headers(monkeypatch):
         "api.auth_middleware.resolve_user_from_token",
         lambda tok: {"uid": 1, "username": "testuser", "email": "testuser@example.com", "role": "End User"}
     )
+    monkeypatch.setattr("main.ensure_default_user_dashboard_data", lambda *a, **k: None)
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
@@ -200,6 +201,7 @@ def test_login_verify_success_mocked(client, monkeypatch):
     monkeypatch.setattr("main.record_login_activity", lambda *args, **kwargs: True)
     monkeypatch.setattr("main.create_user_session", lambda *args, **kwargs: True)
     monkeypatch.setattr("main.ensure_default_user_dashboard_data", lambda *args, **kwargs: True)
+    monkeypatch.setattr("main.record_connected_app_signin", lambda *args, **kwargs: True)
 
     payload = {
         "id": "test-valid-passkey-id",

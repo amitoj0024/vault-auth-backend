@@ -9,13 +9,14 @@ from api.rbac import get_user_role, ROLES
 from api.dashboard import _to_local_datetime, cleanup_expired_sessions, format_relative_timestamp, format_live_relative
 
 
-def _fmt_dt_local(dt):
+def _fmt_dt_local(dt, include_seconds=False):
     """Format DB timestamps (UTC naive) into local readable datetime strings."""
     if not dt:
         return "—"
     local_dt = _to_local_datetime(dt) or dt
     if hasattr(local_dt, "strftime"):
-        return local_dt.strftime("%b %d, %Y %I:%M %p")
+        fmt = "%b %d, %Y %I:%M:%S %p" if include_seconds else "%b %d, %Y %I:%M %p"
+        return local_dt.strftime(fmt)
     return str(local_dt)
 
 
@@ -376,16 +377,42 @@ def admin_revoke_all_user_sessions(target_uid, actor_uid):
     return True, f"Revoked {count} session(s)"
 
 
+def _minute_bucket(dt, explicit_bucket=None):
+    """Return local minute-truncated datetime (or raw fallback) for grouping same-minute events."""
+    raw = explicit_bucket or dt
+    local_dt = _to_local_datetime(raw) or raw
+    if hasattr(local_dt, "replace"):
+        return local_dt.replace(second=0, microsecond=0)
+    return raw
+
+
+def _tally_statuses(items, default="Unknown"):
+    counts = {}
+    for item in items:
+        st = item.get("status") or default
+        counts[st] = counts.get(st, 0) + 1
+    has_failure = any(str(k).lower() != "success" for k in counts)
+    return counts, has_failure
+
+
+def _extract_group_counts(count_res):
+    if isinstance(count_res, list) and count_res:
+        total = int(count_res[0].get("cnt") or 0)
+        raw_total = int(count_res[0].get("raw_cnt") if count_res[0].get("raw_cnt") is not None else total)
+        return total, raw_total
+    return 0, 0
+
+
 def get_admin_login_activity(search=None, status_filter=None, date_from=None, date_to=None, page=1, per_page=25):
-    """Get all login activity for admin monitoring."""
+    """Get login activity for admin monitoring, grouped by user UID and minute timestamp."""
     try:
         conditions = []
         params = []
 
         if search:
-            conditions.append("(LOWER(u.username) LIKE %s OR LOWER(u.email) LIKE %s)")
+            conditions.append("(LOWER(u.username) LIKE %s OR LOWER(u.email) LIKE %s OR LOWER(COALESCE(u.full_name, '')) LIKE %s)")
             term = f"%{search.lower()}%"
-            params.extend([term, term])
+            params.extend([term, term, term])
 
         if status_filter and status_filter != "all":
             conditions.append("LOWER(la.status) = %s")
@@ -410,32 +437,60 @@ def get_admin_login_activity(search=None, status_filter=None, date_from=None, da
         offset = (page - 1) * per_page
 
         count_res = execute_query(
-            f"SELECT COUNT(*) as cnt FROM login_activity la JOIN users u ON la.uid = u.uid {where}",
-            tuple(params) if params else None
+            f"""
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(group_size), 0) AS raw_cnt
+            FROM (
+                SELECT COUNT(*) AS group_size
+                FROM login_activity la
+                JOIN users u ON la.uid = u.uid
+                {where}
+                GROUP BY la.uid, DATE_TRUNC('minute', la.created_at)
+            ) grouped
+            """,
+            tuple(params) if params else None,
         )
-        total = count_res[0]["cnt"] if isinstance(count_res, list) and count_res else 0
+        total, raw_total = _extract_group_counts(count_res)
 
         query = f"""
-        SELECT la.id, la.uid, u.username, u.email, la.device_name, la.device_type,
-               la.browser, la.os, la.location, la.ip_address, la.status, la.created_at
-        FROM login_activity la
-        JOIN users u ON la.uid = u.uid
-        {where}
-        ORDER BY la.created_at DESC
-        LIMIT %s OFFSET %s
+        WITH filtered AS (
+            SELECT la.id, la.uid, u.username, u.full_name, u.email,
+                   la.device_name, la.device_type, la.browser, la.os,
+                   la.location, la.ip_address, la.status, la.created_at,
+                   DATE_TRUNC('minute', la.created_at) AS time_bucket
+            FROM login_activity la
+            JOIN users u ON la.uid = u.uid
+            {where}
+        ),
+        page_groups AS (
+            SELECT uid, time_bucket, MAX(created_at) AS latest_at
+            FROM filtered
+            GROUP BY uid, time_bucket
+            ORDER BY MAX(created_at) DESC
+            LIMIT %s OFFSET %s
+        )
+        SELECT f.*
+        FROM filtered f
+        JOIN page_groups pg
+          ON f.uid = pg.uid
+         AND f.time_bucket = pg.time_bucket
+        ORDER BY pg.latest_at DESC, f.created_at DESC, f.id DESC
         """
         p = list(params) + [per_page, offset]
         rows = execute_query(query, tuple(p))
 
-        activities = []
+        buckets = {}
         if isinstance(rows, list):
             for r in rows:
                 created = r.get("created_at")
                 created_local = _to_local_datetime(created) or created
-                activities.append({
+                bucket = _minute_bucket(created, r.get("time_bucket"))
+                bucket_key = bucket.isoformat() if hasattr(bucket, "isoformat") else str(bucket or "")
+                group_key = f"{r['uid']}:{bucket_key}"
+                event_entry = {
                     "id": r["id"],
                     "uid": r["uid"],
                     "username": r["username"],
+                    "full_name": r.get("full_name") or r["username"],
                     "email": r["email"],
                     "device_name": r.get("device_name", "—"),
                     "device_type": r.get("device_type", "desktop"),
@@ -445,67 +500,188 @@ def get_admin_login_activity(search=None, status_filter=None, date_from=None, da
                     "ip_address": r.get("ip_address", "—"),
                     "status": r.get("status", "Unknown"),
                     "created_at": _fmt_dt_local(created),
+                    "created_at_exact": _fmt_dt_local(created, include_seconds=True),
                     "created_at_iso": created_local.isoformat() if hasattr(created_local, "isoformat") else str(created_local or ""),
-                })
+                }
+                if group_key not in buckets:
+                    buckets[group_key] = {
+                        "group_key": group_key,
+                        "time_bucket": _fmt_dt_local(bucket),
+                        "lead": event_entry,
+                        "events": [],
+                    }
+                buckets[group_key]["events"].append(event_entry)
 
-        return {"activities": activities, "total": total, "page": page, "per_page": per_page, "pages": max(1, -(-total // per_page))}
+        activities = []
+        for g in buckets.values():
+            lead = g["lead"]
+            events = g["events"]
+            status_counts, has_failure = _tally_statuses(events, default="Unknown")
+            activities.append({
+                **lead,
+                "group_key": g["group_key"],
+                "time_bucket": g["time_bucket"],
+                "created_at": g["time_bucket"] if g["time_bucket"] != "—" else lead["created_at"],
+                "created_at_exact": lead["created_at_exact"],
+                "event_count": len(events),
+                "status_counts": status_counts,
+                "has_failure": has_failure,
+                "events": events,
+            })
+
+        return {
+            "activities": activities,
+            "total": total,
+            "raw_total": raw_total,
+            "page": page,
+            "per_page": per_page,
+            "pages": max(1, -(-total // per_page)),
+        }
     except Exception as e:
         safe_print(f"Admin login activity error: {e}")
-        return {"activities": [], "total": 0, "page": 1, "per_page": per_page, "pages": 1}
+        return {"activities": [], "total": 0, "raw_total": 0, "page": 1, "per_page": per_page, "pages": 1}
 
 
 def get_audit_logs(search=None, event_filter=None, page=1, per_page=25):
-    """Retrieve audit log entries with optional filters."""
+    """Retrieve audit log entries grouped by user UID and minute timestamp."""
     try:
         conditions = []
         params = []
 
         if search:
-            conditions.append("(LOWER(actor_username) LIKE %s OR LOWER(target_username) LIKE %s OR LOWER(event_type) LIKE %s)")
+            conditions.append(
+                "(LOWER(COALESCE(al.actor_username, '')) LIKE %s "
+                "OR LOWER(COALESCE(al.target_username, '')) LIKE %s "
+                "OR LOWER(COALESCE(al.event_type, '')) LIKE %s "
+                "OR LOWER(COALESCE(al.details, '')) LIKE %s)"
+            )
             term = f"%{search.lower()}%"
-            params.extend([term, term, term])
+            params.extend([term, term, term, term])
 
         if event_filter and event_filter != "all":
-            conditions.append("LOWER(event_type) LIKE %s")
+            conditions.append("LOWER(al.event_type) LIKE %s")
             params.append(f"%{event_filter.lower()}%")
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         offset = (page - 1) * per_page
 
-        count_res = execute_query(f"SELECT COUNT(*) as cnt FROM audit_logs {where}", tuple(params) if params else None)
-        total = count_res[0]["cnt"] if isinstance(count_res, list) and count_res else 0
+        count_res = execute_query(
+            f"""
+            SELECT COUNT(*) AS cnt, COALESCE(SUM(group_size), 0) AS raw_cnt
+            FROM (
+                SELECT COUNT(*) AS group_size
+                FROM audit_logs al
+                {where}
+                GROUP BY COALESCE(al.actor_uid, al.target_uid, -1), DATE_TRUNC('minute', al.created_at)
+            ) grouped
+            """,
+            tuple(params) if params else None,
+        )
+        total, raw_total = _extract_group_counts(count_res)
 
         query = f"""
-        SELECT id, event_type, actor_uid, actor_username, target_uid, target_username,
-               ip_address, status, details, created_at
-        FROM audit_logs {where}
-        ORDER BY created_at DESC
-        LIMIT %s OFFSET %s
+        WITH filtered AS (
+            SELECT al.id, al.event_type, al.actor_uid, al.actor_username,
+                   al.target_uid, al.target_username, al.ip_address, al.status,
+                   al.details, al.created_at,
+                   COALESCE(al.actor_uid, al.target_uid, -1) AS group_uid,
+                   DATE_TRUNC('minute', al.created_at) AS time_bucket
+            FROM audit_logs al
+            {where}
+        ),
+        page_groups AS (
+            SELECT group_uid, time_bucket, MAX(created_at) AS latest_at
+            FROM filtered
+            GROUP BY group_uid, time_bucket
+            ORDER BY MAX(created_at) DESC
+            LIMIT %s OFFSET %s
+        )
+        SELECT f.*, u.full_name, u.username AS user_username
+        FROM filtered f
+        JOIN page_groups pg
+          ON f.group_uid = pg.group_uid
+         AND f.time_bucket = pg.time_bucket
+        LEFT JOIN users u
+          ON u.uid = COALESCE(f.actor_uid, f.target_uid)
+        ORDER BY pg.latest_at DESC, f.created_at DESC, f.id DESC
         """
         p = list(params) + [per_page, offset]
         rows = execute_query(query, tuple(p))
 
-        logs = []
+        buckets = {}
         if isinstance(rows, list):
             for r in rows:
                 created = r.get("created_at")
-                logs.append({
+                bucket = _minute_bucket(created, r.get("time_bucket"))
+                bucket_key = bucket.isoformat() if hasattr(bucket, "isoformat") else str(bucket or "")
+                eff_uid = r.get("actor_uid") if r.get("actor_uid") is not None else r.get("target_uid")
+                group_uid = r.get("group_uid") if r.get("group_uid") is not None else (eff_uid if eff_uid is not None else -1)
+                group_key = f"{group_uid}:{bucket_key}"
+                log_entry = {
                     "id": r["id"],
+                    "uid": eff_uid,
                     "event_type": r["event_type"],
                     "actor_uid": r.get("actor_uid"),
-                    "actor_username": r.get("actor_username") or "System",
+                    "actor_username": r.get("actor_username") or r.get("user_username") or "System",
+                    "full_name": r.get("full_name") or r.get("actor_username") or r.get("user_username") or "System",
                     "target_uid": r.get("target_uid"),
                     "target_username": r.get("target_username") or "—",
                     "ip_address": r.get("ip_address", "—"),
                     "status": r.get("status", "Success"),
                     "details": r.get("details") or "",
                     "created_at": _fmt_dt_local(created),
-                })
+                    "created_at_exact": _fmt_dt_local(created, include_seconds=True),
+                }
+                if group_key not in buckets:
+                    buckets[group_key] = {
+                        "group_key": group_key,
+                        "uid": eff_uid,
+                        "time_bucket": _fmt_dt_local(bucket),
+                        "lead": log_entry,
+                        "events": [],
+                    }
+                buckets[group_key]["events"].append(log_entry)
 
-        return {"logs": logs, "total": total, "page": page, "per_page": per_page, "pages": max(1, -(-total // per_page))}
+        logs = []
+        for g in buckets.values():
+            lead = g["lead"]
+            events = g["events"]
+            ev_counts = {}
+            for ev in events:
+                et = ev["event_type"]
+                ev_counts[et] = ev_counts.get(et, 0) + 1
+            event_types = [
+                {"event_type": et, "count": cnt}
+                for et, cnt in sorted(ev_counts.items(), key=lambda x: -x[1])
+            ]
+            status_counts, has_failure = _tally_statuses(events, default="Success")
+            actor_name = next((e["actor_username"] for e in events if e["actor_username"] and e["actor_username"] != "System"), lead["actor_username"])
+            logs.append({
+                **lead,
+                "actor_username": actor_name,
+                "uid": g["uid"],
+                "group_key": g["group_key"],
+                "time_bucket": g["time_bucket"],
+                "created_at": g["time_bucket"] if g["time_bucket"] != "—" else lead["created_at"],
+                "created_at_exact": lead["created_at_exact"],
+                "event_count": len(events),
+                "event_types": event_types,
+                "status_counts": status_counts,
+                "has_failure": has_failure,
+                "events": events,
+            })
+
+        return {
+            "logs": logs,
+            "total": total,
+            "raw_total": raw_total,
+            "page": page,
+            "per_page": per_page,
+            "pages": max(1, -(-total // per_page)),
+        }
     except Exception as e:
         safe_print(f"Audit logs error: {e}")
-        return {"logs": [], "total": 0, "page": 1, "per_page": per_page, "pages": 1}
+        return {"logs": [], "total": 0, "raw_total": 0, "page": 1, "per_page": per_page, "pages": 1}
 
 
 def get_runtime_security_settings():
@@ -681,26 +857,32 @@ def get_roles_overview():
 
 
 def get_admin_connected_apps():
-    """Aggregate live workspace connected applications and connected user emails from Postgres."""
+    """Aggregate live workspace connected applications and real user accounts from Postgres."""
     try:
-        query = """
-        SELECT ca.id, ca.uid, u.email, u.username, ca.app_key, ca.app_name, ca.app_desc,
+        test_filter = (
+            "WHERE u.email !~* '@(vaultauth\\.test|test\\.vault\\.io|example\\.com|vault\\.io)$' "
+            "AND u.email !~* '^(employee_|reg_)[0-9]+@'"
+        )
+        query = f"""
+        SELECT ca.id, ca.uid, u.email, u.username, u.full_name, ca.app_key, ca.app_name, ca.app_desc,
                ca.logo_char, ca.logo_bg, ca.permissions, ca.connected_at,
                COALESCE(ca.last_used_at, ca.connected_at) AS last_used,
                COALESCE(ca.login_count, 1) AS login_count,
                ca.is_active
         FROM connected_apps ca
         JOIN users u ON ca.uid = u.uid
+        {test_filter}
         ORDER BY COALESCE(ca.last_used_at, ca.connected_at) DESC, ca.id DESC
         """
         rows = execute_query(query)
         if isinstance(rows, str) and rows.startswith("Error:"):
-            fallback_query = """
-            SELECT ca.id, ca.uid, u.email, u.username, ca.app_key, ca.app_name, ca.app_desc,
+            fallback_query = f"""
+            SELECT ca.id, ca.uid, u.email, u.username, u.full_name, ca.app_key, ca.app_name, ca.app_desc,
                    ca.logo_char, ca.logo_bg, ca.permissions, ca.connected_at,
                    ca.connected_at AS last_used, 1 AS login_count, ca.is_active
             FROM connected_apps ca
             JOIN users u ON ca.uid = u.uid
+            {test_filter}
             ORDER BY ca.connected_at DESC, ca.id DESC
             """
             rows = execute_query(fallback_query)
@@ -759,6 +941,7 @@ def get_admin_connected_apps():
                         "uid": uid,
                         "email": r.get("email"),
                         "username": r.get("username"),
+                        "full_name": r.get("full_name") or r.get("username"),
                         "is_active": is_act,
                         "login_count": int(r.get("login_count") or 1),
                         "last_used_at": format_relative_timestamp(r.get("last_used") or r.get("connected_at")),
