@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -41,6 +41,9 @@ from api.admin import (
     get_runtime_security_settings,
     update_admin_settings,
     get_roles_overview,
+    get_admin_connected_apps,
+    admin_toggle_connected_app,
+    admin_disconnect_connected_app,
     record_audit_log,
 )
 from api.dashboard import (
@@ -52,6 +55,8 @@ from api.dashboard import (
     revoke_other_sessions,
     get_connected_applications,
     disconnect_application,
+    reconnect_application,
+    record_connected_app_signin,
     get_security_checklist,
     calculate_security_score,
     get_user_profile,
@@ -168,6 +173,56 @@ def username(id):
         return jsonify({"message": f"Error: {e}"}), 500
 
 
+def _build_otp_challenge_response(identifier, intro_text, allow_delivery_recovery=False):
+    """Generate an OTP challenge and build a standardized JSON response tuple."""
+    if app.config.get("TESTING"):
+        otp_exp = 300
+        otp_info, otp_err = create_otp(identifier)
+    else:
+        otp_exp = get_runtime_security_settings().get("otp_expiry_seconds", 300)
+        otp_info, otp_err = create_otp(identifier, expires_in_seconds=otp_exp)
+
+    if isinstance(otp_info, dict) and otp_info.get("rate_limited"):
+        return jsonify({"message": otp_err, "retry_after": otp_info.get("retry_after", 900)}), 429
+    if isinstance(otp_info, dict) and otp_info.get("cooldown_remaining"):
+        return jsonify({
+            "message": otp_err,
+            "retry_after": otp_info.get("cooldown_remaining"),
+            "cooldown": otp_info.get("cooldown_remaining"),
+        }), 429
+
+    if otp_err or (isinstance(otp_info, dict) and otp_info.get("email_sent") is False):
+        err_detail = (otp_info or {}).get("email_err") or otp_err or "Email could not be delivered"
+        if not allow_delivery_recovery:
+            return jsonify({"message": f"Two-factor OTP delivery failed: {err_detail}"}), 500
+        masked = mask_email(identifier)
+        return jsonify({
+            "success": True,
+            "otp_required": True,
+            "requires_otp": True,
+            "identifier": identifier,
+            "email_masked": masked,
+            "email_sent": False,
+            "expires_in": otp_exp,
+            "cooldown": 0,
+            "message": f"Account created, but verification email could not be sent: {err_detail}. Please click Resend code to try again.",
+        }), 200
+
+    target_email = (otp_info or {}).get("email") or identifier
+    masked = mask_email(target_email)
+    return jsonify({
+        "success": True,
+        "otp_required": True,
+        "requires_otp": True,
+        "identifier": target_email,
+        "email_masked": masked,
+        "email_sent": True,
+        "expires_in": (otp_info or {}).get("expires_in", otp_exp),
+        "cooldown": (otp_info or {}).get("cooldown", 60),
+        "message": f"{intro_text} {masked}.",
+    }), 200
+
+
 @app.route("/api/register", methods=["POST"])
 @rate_limit(max_requests=10, window_seconds=60, key_prefix="register")
 def create_user():
@@ -225,6 +280,20 @@ def create_user():
             log_security_event("REGISTRATION_FAILED", details=f"username={username}")
             return jsonify({"message": "Registration failed. Username or email may already be taken."}), 400
         log_security_event("REGISTRATION_SUCCESS", details=f"username={username}")
+
+        explicit_otp = data.get("require_otp")
+        should_send_otp = (
+            bool(explicit_otp)
+            if explicit_otp is not None
+            else (not app.config.get("TESTING") and get_runtime_security_settings().get("mfa_required"))
+        )
+        if should_send_otp:
+            return _build_otp_challenge_response(
+                data["email"],
+                "Account created! Verification code sent to",
+                allow_delivery_recovery=True,
+            )
+
         return jsonify(result), 200
     except Exception as e:
         safe_print(f"Registration error: {e}")
@@ -293,41 +362,30 @@ def login():
 
         # Trigger OTP step if explicitly requested or enforced by enterprise policy
         if data.get("require_otp") or runtime_cfg.get("mfa_required"):
-            otp_exp = runtime_cfg.get("otp_expiry_seconds", 300)
-            otp_info, otp_err = create_otp(email_val or user or login_identifier, expires_in_seconds=otp_exp)
-            if isinstance(otp_info, dict) and otp_info.get("rate_limited"):
-                return jsonify({"message": otp_err, "retry_after": otp_info.get("retry_after", 900)}), 429
-            if isinstance(otp_info, dict) and otp_info.get("cooldown_remaining"):
-                return jsonify({
-                    "message": otp_err,
-                    "retry_after": otp_info.get("cooldown_remaining"),
-                    "cooldown": otp_info.get("cooldown_remaining"),
-                }), 429
-            if otp_err or (isinstance(otp_info, dict) and otp_info.get("email_sent") is False):
-                err_detail = (otp_info or {}).get("email_err") or otp_err or "Email could not be delivered"
-                return jsonify({"message": f"Two-factor OTP delivery failed: {err_detail}"}), 500
-            masked = mask_email(otp_info.get("email") or email_val or login_identifier)
-            return jsonify({
-                "otp_required": True,
-                "requires_otp": True,
-                "identifier": otp_info.get("email") or user or login_identifier,
-                "email_masked": masked,
-                "expires_in": otp_info.get("expires_in", otp_exp),
-                "cooldown": otp_info.get("cooldown", 60),
-                "message": f"Two-factor verification required. Code sent to {masked}.",
-            }), 200
+            return _build_otp_challenge_response(
+                email_val or user or login_identifier,
+                "Two-factor verification required. Code sent to",
+                allow_delivery_recovery=False,
+            )
 
         token_res = generate_token({"username": user, "uid": uid, "role": role_val})
         raw_token = token_res[0] if isinstance(token_res, tuple) else token_res
         s_token = session_token(raw_token, expiration_seconds=timeout_seconds)
         session["token"] = s_token
 
-        # Record successful session & activity for dashboard
+        # Record successful session, connected app usage & activity for dashboard
         try:
             if uid:
+                user_ctx = {"username": user, "uid": uid, "email": email_val}
                 record_login_activity(uid, request, status="Success")
                 create_user_session(uid, s_token, request)
-                ensure_default_user_dashboard_data(uid, {"username": user, "uid": uid})
+                ensure_default_user_dashboard_data(uid, user_ctx)
+                record_connected_app_signin(
+                    uid,
+                    user_ctx,
+                    req=request,
+                    client_app=data.get("client_app") or data.get("app_key"),
+                )
         except Exception as e:
             safe_print(f"Session tracking notice: {e}")
 
@@ -651,12 +709,18 @@ def verify_otp_endpoint():
         s_token = session_token(raw_token, expiration_seconds=timeout_seconds)
         session["token"] = s_token
 
-        # Record verified OTP session & activity for dashboard
+        # Record verified OTP session, connected app usage & activity for dashboard
         try:
             if uid:
                 record_login_activity(uid, request, status="Success")
                 create_user_session(uid, s_token, request)
                 ensure_default_user_dashboard_data(uid, user)
+                record_connected_app_signin(
+                    uid,
+                    user,
+                    req=request,
+                    client_app=data.get("client_app") or data.get("app_key"),
+                )
         except Exception as e:
             safe_print(f"OTP session tracking notice: {e}")
 
@@ -721,7 +785,8 @@ def verify():
                     exp_dt = datetime.fromisoformat(exp_dt)
                 except Exception:
                     exp_dt = None
-            if isinstance(exp_dt, datetime) and exp_dt <= datetime.now():
+            utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if isinstance(exp_dt, datetime) and exp_dt <= utc_now:
                 return jsonify({"valid": False, "message": "Session has expired"}), 401
     except Exception as e:
         safe_print(f"[Verify Session Check]: {e}")
@@ -960,7 +1025,7 @@ def admin_get_sessions():
         status_filter = request.args.get("status", "all")
         page = max(1, int(request.args.get("page", 1) or 1))
         per_page = min(100, max(5, int(request.args.get("per_page", 20) or 20)))
-        result = get_admin_all_sessions(search, status_filter, page, per_page)
+        result = get_admin_all_sessions(search, status_filter, page, per_page, current_token=g.token)
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
@@ -993,6 +1058,62 @@ def admin_revoke_user_sessions(target_uid):
                          actor_username=g.user.get("username"), target_uid=target_uid,
                          ip_address=request.remote_addr)
         return jsonify({"success": success, "message": msg}), 200 if success else 400
+    except Exception as e:
+        return jsonify({"message": f"Error: {e}"}), 500
+
+
+@app.route("/api/admin/connected-apps", methods=["GET"])
+@require_auth
+@require_admin
+def admin_list_connected_apps():
+    """Admin: live workspace connected applications with user counts, emails, and activity."""
+    try:
+        data = get_admin_connected_apps()
+        return jsonify(data), 200
+    except Exception as e:
+        return jsonify({"message": f"Error: {e}"}), 500
+
+
+@app.route("/api/admin/connected-apps/<string:app_key>/toggle", methods=["POST"])
+@require_auth
+@require_admin
+def admin_toggle_app(app_key):
+    """Admin: toggle a connected application active/inactive across workspace."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        desired = payload.get("is_active") if "is_active" in payload else None
+        target_uid = payload.get("uid")
+        success, msg, new_state = admin_toggle_connected_app(app_key, is_active=desired, target_uid=target_uid)
+        if success:
+            action = "ADMIN_APP_ENABLED" if new_state else "ADMIN_APP_DISABLED"
+            record_audit_log(
+                action,
+                actor_uid=g.user["uid"],
+                actor_username=g.user.get("username"),
+                details=f"app_key={app_key} is_active={new_state}",
+                ip_address=get_client_ip(request),
+            )
+        return jsonify({"success": success, "message": msg, "is_active": new_state}), 200 if success else 404
+    except Exception as e:
+        return jsonify({"message": f"Error: {e}"}), 500
+
+
+@app.route("/api/admin/connected-apps/<string:app_key>", methods=["DELETE"])
+@require_auth
+@require_admin
+def admin_remove_connected_app(app_key):
+    """Admin: disconnect/disable all active user grants for a connected application."""
+    try:
+        success, msg, new_state = admin_disconnect_connected_app(app_key)
+        if success:
+            record_audit_log(
+                "ADMIN_APP_DISCONNECTED",
+                actor_uid=g.user["uid"],
+                actor_username=g.user.get("username"),
+                details=f"app_key={app_key}",
+                ip_address=get_client_ip(request),
+            )
+        return jsonify({"success": success, "message": msg, "is_active": new_state}), 200 if success else 404
     except Exception as e:
         return jsonify({"message": f"Error: {e}"}), 500
 
@@ -1228,7 +1349,11 @@ def revoke_others():
 def list_connected_apps():
     try:
         ensure_default_user_dashboard_data(g.user["uid"], g.user)
-        apps = get_connected_applications(g.user["uid"])
+        include_inactive = request.args.get("include_inactive", "").lower() in ("true", "1", "yes")
+        if include_inactive:
+            apps = get_connected_applications(g.user["uid"], include_inactive=True)
+        else:
+            apps = get_connected_applications(g.user["uid"])
         return jsonify(apps), 200
     except Exception as e:
         safe_print(f"Connected apps error: {e}")
@@ -1246,6 +1371,19 @@ def delete_connected_app(app_id):
     except Exception as e:
         safe_print(f"Disconnect app error: {e}")
         return jsonify({"message": f"Error disconnecting app: {e}"}), 500
+
+
+@app.route("/api/connected-apps/<int:app_id>/reconnect", methods=["POST"])
+@require_auth
+def reconnect_connected_app(app_id):
+    try:
+        success, msg = reconnect_application(g.user["uid"], app_id)
+        if success:
+            return jsonify({"success": True, "message": msg}), 200
+        return jsonify({"success": False, "message": msg}), 404
+    except Exception as e:
+        safe_print(f"Reconnect app error: {e}")
+        return jsonify({"message": f"Error reconnecting app: {e}"}), 500
 
 
 @app.route("/api/security/checklist", methods=["GET"])
@@ -1405,11 +1543,17 @@ def webauthn_login_verify():
         s_token = session_token(raw_token, expiration_seconds=timeout_seconds)
         session["token"] = s_token
 
-        # Create session tracking and login activity records
+        # Create session tracking, connected app usage, and login activity records
         try:
             record_login_activity(uid, request, status="Success")
             create_user_session(uid, s_token, request)
             ensure_default_user_dashboard_data(uid, user)
+            record_connected_app_signin(
+                uid,
+                user,
+                req=request,
+                client_app=data.get("client_app") or data.get("app_key"),
+            )
         except Exception as e:
             safe_print(f"WebAuthn session tracking warning: {e}")
 

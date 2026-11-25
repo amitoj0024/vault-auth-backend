@@ -91,6 +91,63 @@ def test_register_duplicate_failure_400(client, monkeypatch):
     assert "taken" in response.get_json()["message"]
 
 
+def test_register_with_require_otp_returns_challenge(client, monkeypatch):
+    monkeypatch.setattr("main.register", lambda data: True)
+    monkeypatch.setattr(
+        "main.create_otp",
+        lambda ident, expires_in_seconds=300: (
+            {
+                "otp": "654321",
+                "email": ident,
+                "expires_in": expires_in_seconds,
+                "cooldown": 60,
+                "email_sent": True,
+                "email_err": None,
+            },
+            None,
+        ),
+    )
+
+    payload = {
+        "username": "otp_new_user",
+        "password": "VaultUser@2026!",
+        "email": "otpuser@example.com",
+        "require_otp": True,
+    }
+    response = client.post("/api/register", json=payload)
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["otp_required"] is True
+    assert data["requires_otp"] is True
+    assert data["identifier"] == "otpuser@example.com"
+    assert data["email_sent"] is True
+    assert "otp" not in data
+
+
+def test_register_with_require_otp_handles_delivery_failure_gracefully(client, monkeypatch):
+    monkeypatch.setattr("main.register", lambda data: True)
+    monkeypatch.setattr(
+        "main.create_otp",
+        lambda ident, expires_in_seconds=300: (
+            {"email_sent": False, "email_err": "SMTP not configured"},
+            None,
+        ),
+    )
+
+    payload = {
+        "username": "otp_retry_user",
+        "password": "VaultUser@2026!",
+        "email": "otpretry@example.com",
+        "require_otp": True,
+    }
+    response = client.post("/api/register", json=payload)
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["otp_required"] is True
+    assert data["email_sent"] is False
+    assert data["cooldown"] == 0
+
+
 def test_login_missing_data(client):
     response = client.post("/api/login", data="null", content_type="application/json")
     assert response.status_code == 400

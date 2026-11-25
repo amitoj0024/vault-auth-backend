@@ -4,7 +4,7 @@ import json
 import uuid
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from api.db import execute_query
 from api.utils import safe_print
 from api.auth_middleware import parse_client_device
@@ -54,15 +54,38 @@ DEFAULT_CONNECTED_APPS = [
 ]
 
 
+def _to_local_datetime(dt):
+    """Convert Postgres UTC naive timestamps to local naive datetimes for display."""
+    if not dt:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt)
+        except Exception:
+            return None
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone().replace(tzinfo=None)
+    # Postgres NOW() / CURRENT_TIMESTAMP stores UTC; only convert if DB time aligns with UTC
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    local_now = datetime.now()
+    if abs((local_now - utc_now).total_seconds()) > 60 and dt <= utc_now + timedelta(minutes=2):
+        return dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    return dt
+
+
 def format_relative_timestamp(dt):
     """Format datetime into human-friendly strings like 'Today, 9:42 AM'."""
     if not dt:
         return "Unknown"
     if isinstance(dt, str):
-        try:
-            dt = datetime.fromisoformat(dt)
-        except Exception:
+        parsed = _to_local_datetime(dt)
+        if parsed is None:
             return dt
+        dt = parsed
+    elif isinstance(dt, datetime):
+        dt = _to_local_datetime(dt) or dt
 
     now = datetime.now()
     today = now.date()
@@ -113,12 +136,94 @@ def ensure_default_user_dashboard_data(uid, user=None):
         for app in DEFAULT_CONNECTED_APPS:
             execute_query("""
                 INSERT INTO connected_apps (
-                    uid, app_key, app_name, app_desc, logo_char, logo_bg, permissions, is_active
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+                    uid, app_key, app_name, app_desc, logo_char, logo_bg, permissions, connected_at, last_used_at, login_count, is_active
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), 1, TRUE)
             """, (
                 uid, app["app_key"], app["app_name"], app["app_desc"],
                 app["logo_char"], app["logo_bg"], json.dumps(app["permissions"])
             ))
+
+
+def _resolve_client_app_metadata(client_app=None, req=None):
+    """Resolve client application metadata from explicit payload, query/headers, or portal origin."""
+    raw = (client_app or "").strip() if client_app else ""
+    if not raw and req is not None:
+        raw = (
+            req.headers.get("X-Client-App")
+            or (req.args.get("app") if hasattr(req, "args") else None)
+            or (req.args.get("client_app") if hasattr(req, "args") else None)
+            or ""
+        ).strip()
+
+    key = raw.lower().replace(" ", "_") if raw else "vaultauth"
+    known_map = {a["app_key"]: a for a in DEFAULT_CONNECTED_APPS}
+    if key in known_map:
+        return known_map[key]
+
+    if not raw or key in ("vaultauth", "vaultauth_sso", "sso", "portal", "admin"):
+        is_admin_ref = bool(req and "/admin" in str(req.headers.get("Referer", "")))
+        return {
+            "app_key": "vaultauth",
+            "app_name": "VaultAuth SSO Portal" if not is_admin_ref else "VaultAuth SSO",
+            "app_desc": "Primary SSO & identity workspace",
+            "logo_char": "V",
+            "logo_bg": "#2563eb",
+            "permissions": ["Single Sign-On", "Profile access", "Session management"],
+        }
+
+    display = raw[:100]
+    return {
+        "app_key": key[:50],
+        "app_name": display,
+        "app_desc": "Connected SSO application",
+        "logo_char": display[:1].upper() or "A",
+        "logo_bg": "#4f46e5",
+        "permissions": ["Single Sign-On", "Profile access"],
+    }
+
+
+def record_connected_app_signin(uid, user=None, req=None, client_app=None):
+    """Update live connected application usage whenever a user signs in with their email."""
+    if not uid:
+        return
+    try:
+        meta = _resolve_client_app_metadata(client_app=client_app, req=req)
+        app_key = meta["app_key"]
+        existing = execute_query(
+            "SELECT id, is_active FROM connected_apps WHERE uid = %s AND app_key = %s ORDER BY id ASC LIMIT 1",
+            (uid, app_key),
+        )
+        if isinstance(existing, list) and existing:
+            row = existing[0]
+            if client_app or app_key == "vaultauth":
+                execute_query(
+                    "UPDATE connected_apps SET is_active = TRUE, last_used_at = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE id = %s",
+                    (row["id"],),
+                )
+            elif row.get("is_active"):
+                execute_query(
+                    "UPDATE connected_apps SET last_used_at = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE id = %s",
+                    (row["id"],),
+                )
+        else:
+            execute_query(
+                """
+                INSERT INTO connected_apps (
+                    uid, app_key, app_name, app_desc, logo_char, logo_bg, permissions, connected_at, last_used_at, login_count, is_active
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), 1, TRUE)
+                """,
+                (
+                    uid,
+                    app_key,
+                    meta["app_name"],
+                    meta["app_desc"],
+                    meta["logo_char"],
+                    meta["logo_bg"],
+                    json.dumps(meta["permissions"]),
+                ),
+            )
+    except Exception as e:
+        safe_print(f"Connected app sign-in tracking notice: {e}")
 
 
 def record_login_activity(uid, req, status="Success"):
@@ -146,17 +251,17 @@ def create_user_session(uid, token, req):
     device = parse_client_device(req)
     session_id = f"sess_{uuid.uuid4().hex[:16]}"
 
-    # Extract or compute expiration
+    # Extract or compute expiration in UTC to align with Postgres NOW()
     expires_at = None
     if token and "." in str(token):
         try:
             exp_ts = int(str(token).split(".")[1])
-            expires_at = datetime.fromtimestamp(exp_ts)
+            expires_at = datetime.fromtimestamp(exp_ts, tz=timezone.utc).replace(tzinfo=None)
         except Exception:
             pass
     if not expires_at:
         exp_sec = int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600)
-        expires_at = datetime.now() + timedelta(seconds=exp_sec)
+        expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=exp_sec)
 
     query = """
     INSERT INTO active_sessions (
@@ -239,21 +344,16 @@ def calculate_security_score(uid):
         # Check password age (< 90 days gives +3 hygiene bonus)
         pwd_changed = sec.get("password_last_changed")
         if pwd_changed:
-            if isinstance(pwd_changed, str):
-                try:
-                    pwd_changed = datetime.fromisoformat(pwd_changed)
-                except Exception:
-                    pwd_changed = None
-            if isinstance(pwd_changed, datetime):
-                if (datetime.now() - pwd_changed).days < 90:
-                    score += 3
-                    breakdown["password_hygiene"] = 3
+            pwd_local = _to_local_datetime(pwd_changed)
+            if isinstance(pwd_local, datetime) and (datetime.now() - pwd_local).days < 90:
+                score += 3
+                breakdown["password_hygiene"] = 3
 
     # 4. Login activity hygiene check (+5 for no blocked/failed logins in last 7 days)
-    week_ago = datetime.now() - timedelta(days=7)
+    week_ago_utc = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=7)
     bad_logins = execute_query(
         "SELECT COUNT(*) as cnt FROM login_activity WHERE uid = %s AND status IN ('Failed', 'Blocked') AND created_at >= %s",
-        (uid, week_ago)
+        (uid, week_ago_utc)
     )
     if isinstance(bad_logins, list) and len(bad_logins) > 0 and isinstance(bad_logins[0], dict) and (bad_logins[0].get("cnt") or 0) == 0:
         score += 5
@@ -291,18 +391,18 @@ def calculate_security_score(uid):
 
 
 def cleanup_expired_sessions(uid=None):
-    """Mark expired sessions as inactive."""
-    now = datetime.now()
+    """Mark expired sessions as inactive (aligned with Postgres UTC timestamps)."""
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         if uid is not None:
             execute_query(
                 "UPDATE active_sessions SET is_active = FALSE WHERE uid = %s AND is_active = TRUE AND expires_at IS NOT NULL AND expires_at <= %s",
-                (uid, now)
+                (uid, utc_now)
             )
         else:
             execute_query(
                 "UPDATE active_sessions SET is_active = FALSE WHERE is_active = TRUE AND expires_at IS NOT NULL AND expires_at <= %s",
-                (now,)
+                (utc_now,)
             )
     except Exception as e:
         safe_print(f"Cleanup expired sessions notice: {e}")
@@ -319,7 +419,7 @@ def get_valid_active_sessions(uid, current_token=None):
     - Does NOT count failed, blocked, expired, revoked, or logged-out records.
     """
     cleanup_expired_sessions(uid)
-    now = datetime.now()
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
 
     query = """
     SELECT id, session_id, session_token, device_name, device_type,
@@ -328,7 +428,7 @@ def get_valid_active_sessions(uid, current_token=None):
     WHERE uid = %s AND is_active = TRUE AND (revoked_at IS NULL) AND (expires_at IS NULL OR expires_at > %s)
     ORDER BY last_activity DESC
     """
-    rows = execute_query(query, (uid, now))
+    rows = execute_query(query, (uid, utc_now))
     if isinstance(rows, str) and rows.startswith("Error:"):
         # Fallback if revoked_at or expires_at columns not yet present in schema
         fallback_query = """
@@ -545,15 +645,26 @@ def revoke_other_sessions(uid, current_token):
     return True, f"Revoked {count} other session(s)"
 
 
-def get_connected_applications(uid):
+def get_connected_applications(uid, include_inactive=False):
     """Retrieve connected third-party applications for the user."""
-    query = """
-    SELECT id, app_key, app_name, app_desc, logo_char, logo_bg, permissions, connected_at, is_active
+    status_clause = "" if include_inactive else "AND is_active = TRUE"
+    query = f"""
+    SELECT id, app_key, app_name, app_desc, logo_char, logo_bg, permissions,
+           connected_at, last_used_at, COALESCE(login_count, 1) as login_count, is_active
     FROM connected_apps
-    WHERE uid = %s AND is_active = TRUE
-    ORDER BY id ASC
+    WHERE uid = %s {status_clause}
+    ORDER BY COALESCE(last_used_at, connected_at) DESC, id ASC
     """
     rows = execute_query(query, (uid,))
+    if isinstance(rows, str) and rows.startswith("Error:"):
+        fallback_query = f"""
+        SELECT id, app_key, app_name, app_desc, logo_char, logo_bg, permissions, connected_at, is_active
+        FROM connected_apps
+        WHERE uid = %s {status_clause}
+        ORDER BY id ASC
+        """
+        rows = execute_query(fallback_query, (uid,))
+
     results = []
 
     if isinstance(rows, list):
@@ -564,16 +675,25 @@ def get_connected_applications(uid):
             except Exception:
                 perms = [raw_perms]
 
+            last_used = r.get("last_used_at") or r.get("connected_at")
+            is_act = bool(r.get("is_active", True))
             results.append({
                 "id": r["id"],
                 "app_key": r["app_key"],
                 "app_name": r["app_name"],
+                "name": r["app_name"],
                 "app_desc": r["app_desc"],
+                "desc": r["app_desc"],
                 "logo_char": r["logo_char"],
+                "logo": r["logo_char"],
                 "logo_bg": r["logo_bg"],
                 "permissions": perms if isinstance(perms, list) else [],
-                "connected_date": format_relative_timestamp(r["connected_at"]),
-                "status": "Active" if r["is_active"] else "Revoked"
+                "connected_date": format_relative_timestamp(r.get("connected_at")),
+                "connectedDate": format_relative_timestamp(r.get("connected_at")),
+                "last_used_at": format_relative_timestamp(last_used),
+                "login_count": r.get("login_count", 1),
+                "is_active": is_act,
+                "status": "Active" if is_act else "Disconnected",
             })
 
     return results
@@ -591,6 +711,20 @@ def disconnect_application(uid, app_id):
     if isinstance(res, list) and len(res) > 0:
         return True, "Application access revoked"
     return False, "Application not found or already revoked"
+
+
+def reconnect_application(uid, app_id):
+    """Re-enable a previously disconnected application for the authenticated user."""
+    query = """
+    UPDATE connected_apps
+    SET is_active = TRUE, last_used_at = NOW(), login_count = COALESCE(login_count, 0) + 1
+    WHERE uid = %s AND id = %s
+    RETURNING id, app_name
+    """
+    res = execute_query(query, (uid, app_id))
+    if isinstance(res, list) and len(res) > 0:
+        return True, f"Reconnected {res[0].get('app_name', 'application')}"
+    return False, "Application not found"
 
 
 def get_security_checklist(uid):
@@ -685,12 +819,7 @@ def get_user_profile(uid):
     joined = sec.get("joined_date") or u.get("c_date")
     joined_formatted = joined.strftime("%B %d, %Y") if hasattr(joined, "strftime") else str(joined or "N/A")
 
-    pwd_changed = sec.get("password_last_changed")
-    if isinstance(pwd_changed, str):
-        try:
-            pwd_changed = datetime.fromisoformat(pwd_changed)
-        except Exception:
-            pwd_changed = None
+    pwd_changed = _to_local_datetime(sec.get("password_last_changed"))
     days_ago = (datetime.now() - pwd_changed).days if isinstance(pwd_changed, datetime) else 30
 
     assigned_role = u.get("role") or "user"

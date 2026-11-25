@@ -1,10 +1,22 @@
 """Service layer for VaultAuth Admin Dashboard."""
 
+import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from api.db import execute_query
 from api.utils import safe_print
 from api.rbac import get_user_role, ROLES
+from api.dashboard import _to_local_datetime, cleanup_expired_sessions, format_relative_timestamp
+
+
+def _fmt_dt_local(dt):
+    """Format DB timestamps (UTC naive) into local readable datetime strings."""
+    if not dt:
+        return "—"
+    local_dt = _to_local_datetime(dt) or dt
+    if hasattr(local_dt, "strftime"):
+        return local_dt.strftime("%b %d, %Y %I:%M %p")
+    return str(local_dt)
 
 
 def record_audit_log(event_type, actor_uid=None, actor_username=None, target_uid=None,
@@ -23,11 +35,17 @@ def record_audit_log(event_type, actor_uid=None, actor_username=None, target_uid
 
 
 def get_admin_dashboard_stats():
-    """Aggregate all statistics for Admin Overview cards."""
+    """Aggregate all live statistics for Admin Overview cards directly from Postgres."""
     try:
+        cleanup_expired_sessions()
+
         # Total users
         r = execute_query("SELECT COUNT(*) as cnt FROM users")
         total_users = r[0]["cnt"] if isinstance(r, list) and r else 0
+
+        # New users today
+        r = execute_query("SELECT COUNT(*) as cnt FROM users WHERE c_date = CURRENT_DATE")
+        new_users_today = r[0]["cnt"] if isinstance(r, list) and r else 0
 
         # Active users (is_active = TRUE)
         r = execute_query("SELECT COUNT(*) as cnt FROM users WHERE is_active = TRUE")
@@ -37,45 +55,75 @@ def get_admin_dashboard_stats():
         r = execute_query("SELECT COUNT(*) as cnt FROM users WHERE role = 'admin'")
         admins = r[0]["cnt"] if isinstance(r, list) and r else 0
 
-        # Active sessions (non-revoked, non-expired)
-        now = datetime.now()
+        # Active sessions (strictly valid: non-revoked, non-expired against DB clock)
         r = execute_query(
-            "SELECT COUNT(*) as cnt FROM active_sessions WHERE is_active = TRUE AND (revoked_at IS NULL) AND (expires_at IS NULL OR expires_at > %s)",
-            (now,)
+            """
+            SELECT COUNT(*) as cnt, COUNT(DISTINCT uid) as unique_users
+            FROM active_sessions
+            WHERE is_active = TRUE
+              AND (revoked_at IS NULL)
+              AND (expires_at IS NULL OR expires_at > NOW()::timestamp)
+            """
         )
         active_sessions = r[0]["cnt"] if isinstance(r, list) and r else 0
+        active_session_users = r[0].get("unique_users", 0) if isinstance(r, list) and r else 0
 
-        # Failed login attempts (last 24h)
-        since = datetime.now() - timedelta(hours=24)
+        # Failed login attempts (last 24h aligned with Postgres UTC NOW())
         r = execute_query(
-            "SELECT COUNT(*) as cnt FROM login_activity WHERE status = 'Failed' AND created_at >= %s",
-            (since,)
+            "SELECT COUNT(*) as cnt FROM login_activity WHERE status = 'Failed' AND created_at >= NOW() - INTERVAL '24 hours'"
         )
         failed_logins = r[0]["cnt"] if isinstance(r, list) and r else 0
 
-        # Suspicious activities: audit_logs with status='Failed' or event_type like UNAUTHORIZED in last 24h
+        # Suspicious activities in last 24h
         try:
             r = execute_query(
-                "SELECT COUNT(*) as cnt FROM audit_logs WHERE (status = 'Failed' OR event_type LIKE '%UNAUTHORIZED%' OR event_type LIKE '%SUSPICIOUS%') AND created_at >= %s",
-                (since,)
+                "SELECT COUNT(*) as cnt FROM audit_logs WHERE (status = 'Failed' OR event_type LIKE '%UNAUTHORIZED%' OR event_type LIKE '%SUSPICIOUS%') AND created_at >= NOW() - INTERVAL '24 hours'"
             )
             suspicious = r[0]["cnt"] if isinstance(r, list) and r else 0
         except Exception:
             suspicious = 0
 
+        # Live workspace connected applications summary
+        apps_summary = get_admin_connected_apps().get("summary", {})
+        sec_cfg = get_runtime_security_settings()
+        mfa_req = bool(sec_cfg.get("mfa_required"))
+        min_pwd = int(sec_cfg.get("password_min_length", 8) or 8)
+        security_score = min(
+            100,
+            max(
+                45,
+                70
+                + (15 if mfa_req else 5)
+                + (10 if min_pwd >= 8 else 0)
+                + (5 if suspicious == 0 else -min(15, suspicious * 2))
+                - (min(15, failed_logins) if failed_logins > 5 else 0),
+            ),
+        )
+
         return {
             "total_users": total_users,
+            "new_users_today": new_users_today,
             "active_users": active_users,
             "administrators": admins,
             "active_sessions": active_sessions,
+            "active_session_users": active_session_users,
             "failed_logins_24h": failed_logins,
             "suspicious_activities_24h": suspicious,
+            "connected_apps_total": apps_summary.get("total_apps", 0),
+            "connected_apps_active": apps_summary.get("active_apps", 0),
+            "connected_apps_inactive": apps_summary.get("inactive_apps", 0),
+            "connected_grants_active": apps_summary.get("total_active_grants", 0),
+            "connected_grants_inactive": apps_summary.get("total_inactive_grants", 0),
+            "security_score": security_score,
         }
     except Exception as e:
         safe_print(f"Admin stats error: {e}")
         return {
-            "total_users": 0, "active_users": 0, "administrators": 0,
-            "active_sessions": 0, "failed_logins_24h": 0, "suspicious_activities_24h": 0
+            "total_users": 0, "new_users_today": 0, "active_users": 0, "administrators": 0,
+            "active_sessions": 0, "active_session_users": 0,
+            "failed_logins_24h": 0, "suspicious_activities_24h": 0,
+            "connected_apps_total": 0, "connected_apps_active": 0, "connected_apps_inactive": 0,
+            "connected_grants_active": 0, "connected_grants_inactive": 0, "security_score": 85,
         }
 
 
@@ -231,9 +279,10 @@ def admin_delete_user(target_uid, actor_uid):
     return False, "Delete failed"
 
 
-def get_admin_all_sessions(search=None, status_filter=None, page=1, per_page=20):
-    """Get all sessions across all users for admin view."""
+def get_admin_all_sessions(search=None, status_filter=None, page=1, per_page=20, current_token=None):
+    """Get sessions across all users for admin view with accurate active/expired/revoked state."""
     try:
+        cleanup_expired_sessions()
         conditions = []
         params = []
 
@@ -243,9 +292,9 @@ def get_admin_all_sessions(search=None, status_filter=None, page=1, per_page=20)
             params.extend([term, term, term])
 
         if status_filter == "active":
-            conditions.append("s.is_active = TRUE AND (s.revoked_at IS NULL)")
+            conditions.append("s.is_active = TRUE AND (s.revoked_at IS NULL) AND (s.expires_at IS NULL OR s.expires_at > NOW()::timestamp)")
         elif status_filter == "revoked":
-            conditions.append("s.is_active = FALSE")
+            conditions.append("(s.is_active = FALSE OR s.revoked_at IS NOT NULL OR (s.expires_at IS NOT NULL AND s.expires_at <= NOW()::timestamp))")
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
         offset = (page - 1) * per_page
@@ -257,8 +306,8 @@ def get_admin_all_sessions(search=None, status_filter=None, page=1, per_page=20)
         total = count_res[0]["cnt"] if isinstance(count_res, list) and count_res else 0
 
         query = f"""
-        SELECT s.id, s.session_id, s.uid, u.username, u.email, s.device_name,
-               s.device_type, s.browser, s.os, s.ip_address, s.location,
+        SELECT s.id, s.session_id, s.session_token, s.uid, u.username, u.email, u.full_name,
+               s.device_name, s.device_type, s.browser, s.os, s.ip_address, s.location,
                s.created_at, s.last_activity, s.is_active, s.expires_at, s.revoked_at
         FROM active_sessions s
         JOIN users u ON s.uid = u.uid
@@ -270,25 +319,21 @@ def get_admin_all_sessions(search=None, status_filter=None, page=1, per_page=20)
         rows = execute_query(query, tuple(p))
 
         sessions = []
-        now = datetime.now()
+        utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
         if isinstance(rows, list):
             for r in rows:
                 expires_at = r.get("expires_at")
-                is_expired = expires_at and expires_at < now if isinstance(expires_at, datetime) else False
-                is_active = r.get("is_active", False) and not is_expired
-
-                def fmt_dt(dt):
-                    if not dt:
-                        return "—"
-                    if hasattr(dt, "strftime"):
-                        return dt.strftime("%b %d, %Y %I:%M %p")
-                    return str(dt)
+                is_expired = expires_at and expires_at < utc_now if isinstance(expires_at, datetime) else False
+                is_revoked = bool(r.get("revoked_at"))
+                is_active = bool(r.get("is_active", False)) and not is_expired and not is_revoked
+                is_current = bool(current_token and r.get("session_token") == current_token)
 
                 sessions.append({
                     "id": r["id"],
                     "session_id": r.get("session_id"),
                     "uid": r["uid"],
                     "username": r["username"],
+                    "full_name": r.get("full_name") or r["username"],
                     "email": r["email"],
                     "device_name": r.get("device_name", "Unknown"),
                     "device_type": r.get("device_type", "desktop"),
@@ -296,10 +341,11 @@ def get_admin_all_sessions(search=None, status_filter=None, page=1, per_page=20)
                     "os": r.get("os", "—"),
                     "ip_address": r.get("ip_address", "—"),
                     "location": r.get("location", "—"),
-                    "created_at": fmt_dt(r.get("created_at")),
-                    "last_activity": fmt_dt(r.get("last_activity")),
+                    "created_at": _fmt_dt_local(r.get("created_at")),
+                    "last_activity": _fmt_dt_local(r.get("last_activity")),
+                    "is_current": is_current,
                     "is_active": is_active,
-                    "status": "Active" if is_active else ("Revoked" if r.get("revoked_at") else "Expired"),
+                    "status": "Current" if (is_active and is_current) else ("Active" if is_active else ("Revoked" if is_revoked else "Expired")),
                 })
 
         return {"sessions": sessions, "total": total, "page": page, "per_page": per_page, "pages": max(1, -(-total // per_page))}
@@ -384,7 +430,7 @@ def get_admin_login_activity(search=None, status_filter=None, date_from=None, da
         if isinstance(rows, list):
             for r in rows:
                 created = r.get("created_at")
-                created_str = created.strftime("%b %d, %Y %I:%M %p") if hasattr(created, "strftime") else str(created or "")
+                created_local = _to_local_datetime(created) or created
                 activities.append({
                     "id": r["id"],
                     "uid": r["uid"],
@@ -397,8 +443,8 @@ def get_admin_login_activity(search=None, status_filter=None, date_from=None, da
                     "location": r.get("location", "—"),
                     "ip_address": r.get("ip_address", "—"),
                     "status": r.get("status", "Unknown"),
-                    "created_at": created_str,
-                    "created_at_iso": created.isoformat() if hasattr(created, "isoformat") else str(created or ""),
+                    "created_at": _fmt_dt_local(created),
+                    "created_at_iso": created_local.isoformat() if hasattr(created_local, "isoformat") else str(created_local or ""),
                 })
 
         return {"activities": activities, "total": total, "page": page, "per_page": per_page, "pages": max(1, -(-total // per_page))}
@@ -442,7 +488,6 @@ def get_audit_logs(search=None, event_filter=None, page=1, per_page=25):
         if isinstance(rows, list):
             for r in rows:
                 created = r.get("created_at")
-                created_str = created.strftime("%b %d, %Y %I:%M %p") if hasattr(created, "strftime") else str(created or "")
                 logs.append({
                     "id": r["id"],
                     "event_type": r["event_type"],
@@ -453,7 +498,7 @@ def get_audit_logs(search=None, event_filter=None, page=1, per_page=25):
                     "ip_address": r.get("ip_address", "—"),
                     "status": r.get("status", "Success"),
                     "details": r.get("details") or "",
-                    "created_at": created_str,
+                    "created_at": _fmt_dt_local(created),
                 })
 
         return {"logs": logs, "total": total, "page": page, "per_page": per_page, "pages": max(1, -(-total // per_page))}
@@ -632,3 +677,174 @@ def get_roles_overview():
     except Exception as e:
         safe_print(f"Roles overview error: {e}")
         return {"roles": [], "permissions": []}
+
+
+def get_admin_connected_apps():
+    """Aggregate live workspace connected applications and connected user emails from Postgres."""
+    try:
+        query = """
+        SELECT ca.id, ca.uid, u.email, u.username, ca.app_key, ca.app_name, ca.app_desc,
+               ca.logo_char, ca.logo_bg, ca.permissions, ca.connected_at,
+               COALESCE(ca.last_used_at, ca.connected_at) AS last_used,
+               COALESCE(ca.login_count, 1) AS login_count,
+               ca.is_active
+        FROM connected_apps ca
+        JOIN users u ON ca.uid = u.uid
+        ORDER BY COALESCE(ca.last_used_at, ca.connected_at) DESC, ca.id DESC
+        """
+        rows = execute_query(query)
+        if isinstance(rows, str) and rows.startswith("Error:"):
+            fallback_query = """
+            SELECT ca.id, ca.uid, u.email, u.username, ca.app_key, ca.app_name, ca.app_desc,
+                   ca.logo_char, ca.logo_bg, ca.permissions, ca.connected_at,
+                   ca.connected_at AS last_used, 1 AS login_count, ca.is_active
+            FROM connected_apps ca
+            JOIN users u ON ca.uid = u.uid
+            ORDER BY ca.connected_at DESC, ca.id DESC
+            """
+            rows = execute_query(fallback_query)
+
+        grouped = {}
+        total_active_grants = 0
+        total_inactive_grants = 0
+
+        if isinstance(rows, list):
+            for r in rows:
+                app_key = (r.get("app_key") or r.get("app_name") or f"app_{r['id']}").lower()
+                raw_perms = r.get("permissions")
+                try:
+                    perms = json.loads(raw_perms) if isinstance(raw_perms, str) else raw_perms
+                except Exception:
+                    perms = [raw_perms] if raw_perms else []
+
+                is_act = bool(r.get("is_active", True))
+                if is_act:
+                    total_active_grants += 1
+                else:
+                    total_inactive_grants += 1
+
+                if app_key not in grouped:
+                    grouped[app_key] = {
+                        "id": app_key,
+                        "row_id": r["id"],
+                        "app_key": app_key,
+                        "name": r.get("app_name") or app_key,
+                        "app_name": r.get("app_name") or app_key,
+                        "desc": r.get("app_desc") or "Enterprise SSO Client",
+                        "app_desc": r.get("app_desc") or "Enterprise SSO Client",
+                        "logo": r.get("logo_char") or (r.get("app_name") or "A")[:1].upper(),
+                        "logo_char": r.get("logo_char") or (r.get("app_name") or "A")[:1].upper(),
+                        "logo_bg": r.get("logo_bg") or "#2563eb",
+                        "permissions": perms if isinstance(perms, list) else [],
+                        "active_users_count": 0,
+                        "inactive_users_count": 0,
+                        "total_logins": 0,
+                        "connected_users": [],
+                        "seen_uids": set(),
+                        "latest_dt": r.get("last_used") or r.get("connected_at"),
+                    }
+
+                entry = grouped[app_key]
+                entry["total_logins"] += int(r.get("login_count") or 1)
+                if is_act:
+                    entry["active_users_count"] += 1
+                else:
+                    entry["inactive_users_count"] += 1
+
+                uid = r["uid"]
+                if uid not in entry["seen_uids"]:
+                    entry["seen_uids"].add(uid)
+                    entry["connected_users"].append({
+                        "uid": uid,
+                        "email": r.get("email"),
+                        "username": r.get("username"),
+                        "is_active": is_act,
+                        "login_count": int(r.get("login_count") or 1),
+                        "last_used_at": format_relative_timestamp(r.get("last_used") or r.get("connected_at")),
+                    })
+
+        apps_list = []
+        active_apps = 0
+        inactive_apps = 0
+        for entry in grouped.values():
+            entry.pop("seen_uids", None)
+            latest_dt = entry.pop("latest_dt", None)
+            is_enabled = entry["active_users_count"] > 0
+            if is_enabled:
+                active_apps += 1
+            else:
+                inactive_apps += 1
+
+            formatted_recent = format_relative_timestamp(latest_dt)
+            entry["is_active"] = is_enabled
+            entry["status"] = "Active" if is_enabled else "Inactive"
+            entry["connectedDate"] = formatted_recent
+            entry["connected_date"] = formatted_recent
+            entry["last_used_at"] = formatted_recent
+            entry["connected_emails"] = [u["email"] for u in entry["connected_users"] if u.get("email") and u.get("is_active")]
+            apps_list.append(entry)
+
+        return {
+            "apps": apps_list,
+            "summary": {
+                "total_apps": len(apps_list),
+                "active_apps": active_apps,
+                "inactive_apps": inactive_apps,
+                "total_active_grants": total_active_grants,
+                "total_inactive_grants": total_inactive_grants,
+            },
+        }
+    except Exception as e:
+        safe_print(f"Admin connected apps error: {e}")
+        return {
+            "apps": [],
+            "summary": {
+                "total_apps": 0,
+                "active_apps": 0,
+                "inactive_apps": 0,
+                "total_active_grants": 0,
+                "total_inactive_grants": 0,
+            },
+        }
+
+
+def admin_toggle_connected_app(app_key, is_active=None, target_uid=None):
+    """Enable or disable a connected SSO application across the workspace (or for a specific user)."""
+    clean_key = str(app_key or "").strip().lower()
+    if not clean_key:
+        return False, "Application key is required", None
+
+    try:
+        where_clause = "WHERE LOWER(app_key) = %s"
+        params = [clean_key]
+        if target_uid is not None:
+            where_clause += " AND uid = %s"
+            params.append(int(target_uid))
+
+        existing = execute_query(
+            f"SELECT id, is_active FROM connected_apps {where_clause}",
+            tuple(params),
+        )
+        if not isinstance(existing, list) or len(existing) == 0:
+            return False, "Connected application not found", None
+
+        if is_active is None:
+            any_active = any(bool(row.get("is_active")) for row in existing)
+            new_state = not any_active
+        else:
+            new_state = bool(is_active)
+
+        update_params = [new_state] + params
+        execute_query(
+            f"UPDATE connected_apps SET is_active = %s WHERE id IN (SELECT id FROM connected_apps {where_clause})",
+            tuple(update_params),
+        )
+        return True, f"Application '{clean_key}' {'enabled' if new_state else 'disabled'}", new_state
+    except Exception as e:
+        safe_print(f"Toggle connected app error: {e}")
+        return False, str(e), None
+
+
+def admin_disconnect_connected_app(app_key):
+    """Disable/revoke all grants for an application across the workspace."""
+    return admin_toggle_connected_app(app_key, is_active=False)

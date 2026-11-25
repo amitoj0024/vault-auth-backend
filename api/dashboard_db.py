@@ -86,9 +86,11 @@ def create_dashboard_tables():
         execute_query(connected_apps_table)
         execute_query(user_security_settings_table)
         
-        # Ensure new session columns exist for backward compatibility
+        # Ensure new session & connected-app columns exist for backward compatibility
         execute_query("ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP;")
         execute_query("ALTER TABLE active_sessions ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMP;")
+        execute_query("ALTER TABLE connected_apps ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP;")
+        execute_query("ALTER TABLE connected_apps ADD COLUMN IF NOT EXISTS login_count INT DEFAULT 1;")
 
         # Create indexes for fast user lookup
         execute_query("CREATE INDEX IF NOT EXISTS idx_sessions_uid ON active_sessions(uid);")
