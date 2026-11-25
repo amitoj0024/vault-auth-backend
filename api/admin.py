@@ -35,26 +35,40 @@ def record_audit_log(event_type, actor_uid=None, actor_username=None, target_uid
         safe_print(f"Audit log error: {e}")
 
 
+_SYNTHETIC_EMAIL_DOMAIN_RE = r"@(vaultauth\.test|test\.vault\.io|example\.com|vault\.io)$"
+_SYNTHETIC_EMAIL_PREFIX_RE = r"^(employee_|reg_)[0-9]+@"
+
+
+def _real_user_sql_condition(alias=""):
+    """SQL predicate excluding synthetic/automated test user accounts."""
+    col = f"{alias}." if alias else ""
+    return (
+        f"({col}email !~* '{_SYNTHETIC_EMAIL_DOMAIN_RE}' "
+        f"AND {col}email !~* '{_SYNTHETIC_EMAIL_PREFIX_RE}')"
+    )
+
+
 def get_admin_dashboard_stats():
     """Aggregate all live statistics for Admin Overview cards directly from Postgres."""
     try:
         cleanup_expired_sessions()
 
-        # Total users
-        r = execute_query("SELECT COUNT(*) as cnt FROM users")
-        total_users = r[0]["cnt"] if isinstance(r, list) and r else 0
-
-        # New users today
-        r = execute_query("SELECT COUNT(*) as cnt FROM users WHERE c_date = CURRENT_DATE")
-        new_users_today = r[0]["cnt"] if isinstance(r, list) and r else 0
-
-        # Active users (is_active = TRUE)
-        r = execute_query("SELECT COUNT(*) as cnt FROM users WHERE is_active = TRUE")
-        active_users = r[0]["cnt"] if isinstance(r, list) and r else 0
-
-        # Administrators
-        r = execute_query("SELECT COUNT(*) as cnt FROM users WHERE role = 'admin'")
-        admins = r[0]["cnt"] if isinstance(r, list) and r else 0
+        real_user_cond = _real_user_sql_condition()
+        r = execute_query(
+            f"""
+            SELECT COUNT(*) AS total_users,
+                   COUNT(*) FILTER (WHERE c_date = CURRENT_DATE) AS new_users_today,
+                   COUNT(*) FILTER (WHERE is_active = TRUE) AS active_users,
+                   COUNT(*) FILTER (WHERE role = 'admin') AS administrators
+            FROM users
+            WHERE {real_user_cond}
+            """
+        )
+        row = r[0] if isinstance(r, list) and r else {}
+        total_users = row.get("total_users", 0)
+        new_users_today = row.get("new_users_today", 0)
+        active_users = row.get("active_users", 0)
+        admins = row.get("administrators", 0)
 
         # Active sessions (strictly valid: non-revoked, non-expired against DB clock)
         r = execute_query(
@@ -129,9 +143,9 @@ def get_admin_dashboard_stats():
 
 
 def get_all_users_admin(search=None, role_filter=None, status_filter=None, page=1, per_page=20):
-    """Retrieve all users with optional filters, with role lookup."""
+    """Retrieve all real users with optional filters, excluding synthetic test accounts."""
     try:
-        conditions = []
+        conditions = [_real_user_sql_condition()]
         params = []
 
         if search:
@@ -803,7 +817,7 @@ def get_roles_overview():
     """Get role distribution and permission mapping."""
     try:
         rows = execute_query(
-            "SELECT role, COUNT(*) as count FROM users GROUP BY role ORDER BY count DESC"
+            f"SELECT role, COUNT(*) as count FROM users WHERE {_real_user_sql_condition()} GROUP BY role ORDER BY count DESC"
         )
         role_counts = {}
         if isinstance(rows, list):
@@ -859,10 +873,7 @@ def get_roles_overview():
 def get_admin_connected_apps():
     """Aggregate live workspace connected applications and real user accounts from Postgres."""
     try:
-        test_filter = (
-            "WHERE u.email !~* '@(vaultauth\\.test|test\\.vault\\.io|example\\.com|vault\\.io)$' "
-            "AND u.email !~* '^(employee_|reg_)[0-9]+@'"
-        )
+        test_filter = f"WHERE {_real_user_sql_condition('u')}"
         query = f"""
         SELECT ca.id, ca.uid, u.email, u.username, u.full_name, ca.app_key, ca.app_name, ca.app_desc,
                ca.logo_char, ca.logo_bg, ca.permissions, ca.connected_at,

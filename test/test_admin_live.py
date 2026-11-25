@@ -306,3 +306,47 @@ def test_security_activity_groups_same_uid_and_minute(monkeypatch):
         {"event_type": "ADMIN_APP_ENABLED", "count": 1},
     ]
     assert any("DATE_TRUNC('minute', al.created_at)" in q for q in audit_queries)
+
+
+def test_admin_user_counts_and_directory_exclude_test_users(monkeypatch):
+    import api.admin as admin
+
+    stats_queries = []
+    users_queries = []
+    roles_queries = []
+
+    def fake_exec(q, p=None):
+        norm = " ".join(str(q).split())
+        if "COUNT(*) AS total_users" in norm:
+            stats_queries.append(norm)
+            return [{"total_users": 4, "new_users_today": 1, "active_users": 4, "administrators": 1}]
+        if "SELECT COUNT(*) as cnt FROM users" in norm:
+            users_queries.append(norm)
+            return [{"cnt": 4}]
+        if "SELECT uid, username, email, full_name" in norm:
+            users_queries.append(norm)
+            return [
+                {"uid": 24, "username": "amy", "email": "amy492998@gmail.com", "full_name": "Amy Admin", "phone": "", "is_active": True, "c_date": "2026-11-25", "role": "admin"},
+            ]
+        if "GROUP BY role ORDER BY count DESC" in norm:
+            roles_queries.append(norm)
+            return [{"role": "user", "count": 3}, {"role": "admin", "count": 1}]
+        return [{"cnt": 0, "unique_users": 0}]
+
+    monkeypatch.setattr(admin, "cleanup_expired_sessions", lambda: None)
+    monkeypatch.setattr(admin, "get_admin_connected_apps", lambda: {"summary": {}})
+    monkeypatch.setattr(admin, "get_runtime_security_settings", lambda: {"mfa_required": False, "password_min_length": 8})
+    monkeypatch.setattr(admin, "execute_query", fake_exec)
+
+    stats = admin.get_admin_dashboard_stats()
+    assert stats["total_users"] == 4
+    assert stats["active_users"] == 4
+    assert any("vaultauth\\.test" in q and "employee_" in q for q in stats_queries)
+
+    users_res = admin.get_all_users_admin(page=1, per_page=20)
+    assert users_res["total"] == 4
+    assert all("vaultauth\\.test" in q for q in users_queries)
+
+    roles_res = admin.get_roles_overview()
+    assert roles_res["roles"][0]["count"] == 1
+    assert any("vaultauth\\.test" in q for q in roles_queries)
