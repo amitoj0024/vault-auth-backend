@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from api.db import execute_query
 from api.utils import safe_print
 from api.rbac import get_user_role, ROLES
-from api.dashboard import _to_local_datetime, cleanup_expired_sessions, format_relative_timestamp
+from api.dashboard import _to_local_datetime, cleanup_expired_sessions, format_relative_timestamp, format_live_relative
 
 
 def _fmt_dt_local(dt):
@@ -343,6 +343,7 @@ def get_admin_all_sessions(search=None, status_filter=None, page=1, per_page=20,
                     "location": r.get("location", "—"),
                     "created_at": _fmt_dt_local(r.get("created_at")),
                     "last_activity": _fmt_dt_local(r.get("last_activity")),
+                    "last_activity_relative": format_live_relative(r.get("last_activity")) if is_active else _fmt_dt_local(r.get("last_activity")),
                     "is_current": is_current,
                     "is_active": is_active,
                     "status": "Current" if (is_active and is_current) else ("Active" if is_active else ("Revoked" if is_revoked else "Expired")),

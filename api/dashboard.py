@@ -106,6 +106,21 @@ def format_relative_timestamp(dt):
         return f"{day_str}, {time_part}" if time_part else day_str
 
 
+def format_live_relative(dt):
+    """Format DB timestamp into real-time relative string ('Active now', '3m ago', etc.)."""
+    local_dt = _to_local_datetime(dt)
+    if local_dt is None:
+        return "Recently"
+    diff_sec = max(0, (datetime.now() - local_dt).total_seconds())
+    if diff_sec < 120:
+        return "Active now"
+    if diff_sec < 3600:
+        return f"{int(diff_sec // 60)}m ago"
+    if diff_sec < 86400:
+        return f"{int(diff_sec // 3600)}h ago"
+    return format_relative_timestamp(dt)
+
+
 def mask_ip_address(ip):
     """Mask client IP address for privacy display (e.g. 103.21.58.xx)."""
     if not ip or ip in ("127.0.0.1", "::1", "localhost"):
@@ -391,18 +406,36 @@ def calculate_security_score(uid):
 
 
 def cleanup_expired_sessions(uid=None):
-    """Mark expired sessions as inactive (aligned with Postgres UTC timestamps)."""
+    """Mark expired or stale legacy sessions as inactive (aligned with Postgres UTC timestamps)."""
     utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    stale_legacy_cutoff = utc_now - timedelta(hours=24)
     try:
         if uid is not None:
             execute_query(
-                "UPDATE active_sessions SET is_active = FALSE WHERE uid = %s AND is_active = TRUE AND expires_at IS NOT NULL AND expires_at <= %s",
-                (uid, utc_now)
+                """
+                UPDATE active_sessions
+                SET is_active = FALSE
+                WHERE uid = %s
+                  AND is_active = TRUE
+                  AND (
+                    (expires_at IS NOT NULL AND expires_at <= %s)
+                    OR (expires_at IS NULL AND last_activity <= %s)
+                  )
+                """,
+                (uid, utc_now, stale_legacy_cutoff),
             )
         else:
             execute_query(
-                "UPDATE active_sessions SET is_active = FALSE WHERE is_active = TRUE AND expires_at IS NOT NULL AND expires_at <= %s",
-                (utc_now,)
+                """
+                UPDATE active_sessions
+                SET is_active = FALSE
+                WHERE is_active = TRUE
+                  AND (
+                    (expires_at IS NOT NULL AND expires_at <= %s)
+                    OR (expires_at IS NULL AND last_activity <= %s)
+                  )
+                """,
+                (utc_now, stale_legacy_cutoff),
             )
     except Exception as e:
         safe_print(f"Cleanup expired sessions notice: {e}")
@@ -472,7 +505,7 @@ def get_valid_active_sessions(uid, current_token=None):
                 "location": r.get("location", "Bengaluru, India"),
                 "ip_address": mask_ip_address(r.get("ip_address")),
                 "created_at": format_relative_timestamp(r.get("created_at")),
-                "last_active": format_relative_timestamp(r.get("last_activity")),
+                "last_active": format_live_relative(r.get("last_activity")),
                 "is_current": is_cur,
                 "is_active": True
             })

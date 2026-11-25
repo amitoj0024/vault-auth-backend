@@ -165,6 +165,10 @@ def test_login_invalid_credentials(client, monkeypatch):
 def test_login_success(client, monkeypatch):
     mock_user = {"uid": 1, "username": "alice", "email": "alice@example.com"}
     monkeypatch.setattr("main.auth_user", lambda login, pwd: mock_user)
+    monkeypatch.setattr("main.record_login_activity", lambda *a, **k: None)
+    monkeypatch.setattr("main.create_user_session", lambda *a, **k: None)
+    monkeypatch.setattr("main.ensure_default_user_dashboard_data", lambda *a, **k: None)
+    monkeypatch.setattr("main.record_connected_app_signin", lambda *a, **k: None)
 
     response = client.post("/api/login", json={"login": "alice", "password": "secretpassword"})
     assert response.status_code == 200
@@ -275,6 +279,10 @@ def test_send_otp_not_found(client, monkeypatch):
 def test_verify_otp_endpoint_success(client, monkeypatch):
     mock_user = {"uid": 2, "username": "alice", "email": "alice@vault.io"}
     monkeypatch.setattr("main.verify_otp", lambda ident, code: (mock_user, None))
+    monkeypatch.setattr("main.record_login_activity", lambda *a, **k: None)
+    monkeypatch.setattr("main.create_user_session", lambda *a, **k: None)
+    monkeypatch.setattr("main.ensure_default_user_dashboard_data", lambda *a, **k: None)
+    monkeypatch.setattr("main.record_connected_app_signin", lambda *a, **k: None)
 
     res = client.post("/api/otp/verify", json={"identifier": "alice", "otp": "654321"})
     assert res.status_code == 200

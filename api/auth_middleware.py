@@ -163,10 +163,10 @@ def require_auth(f):
         g.user = user
         g.token = token
 
-        # Update last activity for this session if it exists in active_sessions
+        # Update last activity for this active session if it exists in active_sessions
         try:
             execute_query(
-                "UPDATE active_sessions SET last_activity = NOW() WHERE session_token = %s",
+                "UPDATE active_sessions SET last_activity = NOW() WHERE session_token = %s AND is_active = TRUE",
                 (token,)
             )
         except Exception:
