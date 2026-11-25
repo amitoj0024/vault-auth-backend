@@ -15,6 +15,12 @@ from api.webauthn_service import (
 )
 
 
+@pytest.fixture(autouse=True)
+def mock_webauthn_audit_log(monkeypatch):
+    """Prevent WebAuthn unit tests from writing synthetic events to live audit_logs."""
+    monkeypatch.setattr("api.webauthn_service.record_audit_log", lambda *a, **k: None)
+
+
 @pytest.fixture
 def auth_headers(monkeypatch):
     """Fixture providing valid authentication headers for user with uid=1."""
