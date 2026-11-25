@@ -145,18 +145,8 @@ def ensure_default_user_dashboard_data(uid, user=None):
             ON CONFLICT (uid) DO NOTHING
         """, (uid, recovery))
 
-    # 2. Connected Apps
-    app_rows = execute_query("SELECT id FROM connected_apps WHERE uid = %s", (uid,))
-    if not isinstance(app_rows, list) or len(app_rows) == 0:
-        for app in DEFAULT_CONNECTED_APPS:
-            execute_query("""
-                INSERT INTO connected_apps (
-                    uid, app_key, app_name, app_desc, logo_char, logo_bg, permissions, connected_at, last_used_at, login_count, is_active
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), 1, TRUE)
-            """, (
-                uid, app["app_key"], app["app_name"], app["app_desc"],
-                app["logo_char"], app["logo_bg"], json.dumps(app["permissions"])
-            ))
+    # 2. Connected Apps are recorded strictly on real SSO/app sign-ins via record_connected_app_signin()
+    return True
 
 
 def _resolve_client_app_metadata(client_app=None, req=None):

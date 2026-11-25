@@ -350,3 +350,20 @@ def test_admin_user_counts_and_directory_exclude_test_users(monkeypatch):
     roles_res = admin.get_roles_overview()
     assert roles_res["roles"][0]["count"] == 1
     assert any("vaultauth\\.test" in q for q in roles_queries)
+
+
+def test_ensure_default_dashboard_data_does_not_seed_dummy_apps(monkeypatch):
+    queries = []
+
+    def fake_exec(q, p=None):
+        norm = " ".join(str(q).split())
+        queries.append(norm)
+        if "SELECT id FROM user_security_settings" in norm:
+            return []
+        return ()
+
+    monkeypatch.setattr(dashboard, "execute_query", fake_exec)
+    dashboard.ensure_default_user_dashboard_data(99, {"uid": 99, "email": "realuser@gmail.com"})
+
+    assert any("INSERT INTO user_security_settings" in q for q in queries)
+    assert not any("INSERT INTO connected_apps" in q for q in queries)
