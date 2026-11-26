@@ -158,8 +158,8 @@ def test_login_invalid_credentials(client, monkeypatch):
     monkeypatch.setattr("main.auth_user", lambda login, pwd: None)
 
     response = client.post("/api/login", json={"login": "nobody", "password": "wrongpassword"})
-    assert response.status_code == 404
-    assert response.get_json()["message"] == "User not found"
+    assert response.status_code == 401
+    assert response.get_json()["message"] == "Invalid email or password. Passwords are case-sensitive."
 
 
 def test_login_success(client, monkeypatch):
@@ -176,6 +176,26 @@ def test_login_success(client, monkeypatch):
     assert data["message"] == "Login successful"
     assert "token" in data
     assert "." in data["token"]
+
+
+def test_login_requires_otp_outside_testing(client, app, monkeypatch):
+    """Production login must never issue a session before OTP (FR-05/FR-08)."""
+    app.config["TESTING"] = False
+    try:
+        monkeypatch.setattr("main.auth_user", lambda login, pwd: {
+            "uid": 1, "username": "alice", "email": "alice@example.com"
+        })
+        monkeypatch.setattr("main.get_runtime_security_settings", lambda: {})
+        monkeypatch.setattr(
+            "main._build_otp_challenge_response",
+            lambda *a, **k: ({"otp_required": True}, 200),
+        )
+        res = client.post("/api/login", json={"login": "alice", "password": "secretpassword"})
+        assert res.status_code == 200
+        assert res.get_json()["otp_required"] is True
+        assert "token" not in res.get_json()
+    finally:
+        app.config["TESTING"] = True
 
 
 def test_openapi_spec(client):
@@ -296,6 +316,21 @@ def test_verify_otp_endpoint_invalid(client, monkeypatch):
     monkeypatch.setattr("main.verify_otp", lambda ident, code: (None, "Invalid or expired OTP"))
     res = client.post("/api/otp/verify", json={"identifier": "alice", "otp": "000000"})
     assert res.status_code == 401
+    assert res.get_json()["message"] == "Invalid or expired OTP"
+
+
+def test_verify_otp_endpoint_rejects_masked_placeholder(client, monkeypatch):
+    """The masked DB placeholder must never be usable as a code (auth bypass)."""
+    called = []
+
+    def fake_verify(ident, code):
+        called.append((ident, code))
+        return (None, "Invalid or expired OTP")
+
+    monkeypatch.setattr("main.verify_otp", fake_verify)
+    res = client.post("/api/otp/verify", json={"identifier": "alice", "otp": "******"})
+    assert res.status_code == 401
+    assert called == []
     assert res.get_json()["message"] == "Invalid or expired OTP"
 
 

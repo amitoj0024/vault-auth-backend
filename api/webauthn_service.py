@@ -16,6 +16,7 @@ from webauthn import (
 from webauthn.helpers import bytes_to_base64url, base64url_to_bytes
 from webauthn.helpers.structs import (
     AuthenticatorSelectionCriteria,
+    CredentialDeviceType,
     UserVerificationRequirement,
     ResidentKeyRequirement,
     PublicKeyCredentialDescriptor,
@@ -40,7 +41,12 @@ def get_rp_name() -> str:
 
 def get_expected_origins() -> List[str]:
     """Retrieve allowed WebAuthn origins."""
-    env_origins = os.getenv("WEBAUTHN_ORIGINS") or os.getenv("CORS_ORIGINS", "")
+    env_origins = (
+        os.getenv("WEBAUTHN_ORIGINS")
+        or os.getenv("WEBAUTHN_RP_EXPECTED_ORIGIN")
+        or os.getenv("WEBAUTHN_ORIGIN")
+        or os.getenv("CORS_ORIGINS", "")
+    )
     if env_origins:
         origins = [o.strip() for o in env_origins.split(",") if o.strip()]
         if origins:
@@ -218,6 +224,24 @@ def verify_and_save_passkey_registration(user: Dict[str, Any], credential_payloa
         public_key_bytes = verified_registration.credential_public_key
         sign_count = verified_registration.sign_count or 0
         aaguid = str(verified_registration.aaguid) if verified_registration.aaguid else None
+        backup_eligible = getattr(verified_registration, "credential_device_type", None) == CredentialDeviceType.MULTI_DEVICE
+        backup_state = bool(getattr(verified_registration, "credential_backed_up", False))
+
+        # Prevent duplicate credential registration explicitly
+        dup_rows = execute_query(
+            "SELECT id FROM webauthn_credentials WHERE credential_id = %s LIMIT 1",
+            (credential_id_str,),
+        )
+        if isinstance(dup_rows, list) and len(dup_rows) > 0:
+            record_audit_log(
+                "WEBAUTHN_REGISTER_FAILED",
+                actor_uid=uid,
+                actor_username=username,
+                ip_address=client_ip,
+                status="Failed",
+                details=f"Duplicate passkey credential_id={credential_id_str[:16]}…",
+            )
+            return False, "This passkey is already registered.", None
 
         # Determine sensible device name if omitted
         resolved_device_name = device_name.strip() if (device_name and device_name.strip()) else "Passkey Authenticator"
@@ -231,8 +255,8 @@ def verify_and_save_passkey_registration(user: Dict[str, Any], credential_payloa
         # Store in database
         insert_query = """
         INSERT INTO webauthn_credentials (
-            uid, credential_id, public_key, sign_count, device_name, transports, aaguid, created_at, last_used_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            uid, credential_id, public_key, sign_count, device_name, transports, aaguid, backup_eligible, backup_state, created_at, last_used_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
         RETURNING id, credential_id, device_name, created_at
         """
         res = execute_query(insert_query, (
@@ -242,10 +266,14 @@ def verify_and_save_passkey_registration(user: Dict[str, Any], credential_payloa
             sign_count,
             resolved_device_name,
             transports,
-            aaguid
+            aaguid,
+            backup_eligible,
+            backup_state,
         ))
 
         if isinstance(res, str) and res.startswith("Error:"):
+            if "duplicate" in res.lower() or "unique" in res.lower():
+                return False, "This passkey is already registered.", None
             return False, f"Failed to save passkey: {res}", None
 
         cred_record = res[0] if (isinstance(res, list) and len(res) > 0) else {}
@@ -264,6 +292,8 @@ def verify_and_save_passkey_registration(user: Dict[str, Any], credential_payloa
             "id": cred_record.get("id"),
             "credential_id": credential_id_str,
             "device_name": resolved_device_name,
+            "backup_eligible": backup_eligible,
+            "backup_state": backup_state,
             "created_at": str(cred_record.get("created_at") or datetime.now()),
         }
 
@@ -292,7 +322,7 @@ def get_passkey_authentication_options(identifier: Optional[str] = None) -> Dict
     target_uid = None
 
     if identifier and identifier.strip():
-        from opperation import get_users
+        from opperation import get_users  # noqa: local import avoids circular dependency
         clean_id = identifier.strip()
         user_records = get_users(clean_id)
         if user_records and len(user_records) > 0:
@@ -419,11 +449,12 @@ def verify_passkey_authentication(credential_payload: Dict[str, Any], client_ip:
             require_user_verification=False,
         )
 
-        # Update sign count and last used timestamp
+        # Update sign count, backup state, and last used timestamp
         new_sign_count = verified_auth.new_sign_count or stored_sign_count
+        new_backup_state = bool(getattr(verified_auth, "credential_backed_up", False))
         execute_query(
-            "UPDATE webauthn_credentials SET sign_count = %s, last_used_at = NOW() WHERE id = %s",
-            (new_sign_count, cred_record["id"])
+            "UPDATE webauthn_credentials SET sign_count = %s, backup_state = %s, last_used_at = NOW() WHERE id = %s",
+            (new_sign_count, new_backup_state, cred_record["id"])
         )
 
         record_audit_log(
@@ -457,7 +488,10 @@ def get_user_passkeys(uid: int) -> List[Dict[str, Any]]:
     """Retrieve all registered passkeys for an employee."""
     from api.dashboard import format_relative_timestamp
     query = """
-    SELECT id, credential_id, device_name, transports, aaguid, created_at, last_used_at
+    SELECT id, credential_id, device_name, transports, aaguid,
+           COALESCE(backup_eligible, FALSE) AS backup_eligible,
+           COALESCE(backup_state, FALSE) AS backup_state,
+           created_at, last_used_at
     FROM webauthn_credentials
     WHERE uid = %s
     ORDER BY created_at DESC
@@ -474,6 +508,8 @@ def get_user_passkeys(uid: int) -> List[Dict[str, Any]]:
                 "credential_id_masked": masked_cid,
                 "device_name": r.get("device_name") or "Passkey",
                 "transports": r.get("transports") or "internal",
+                "backup_eligible": bool(r.get("backup_eligible", False)),
+                "backup_state": bool(r.get("backup_state", False)),
                 "created_at": format_relative_timestamp(r.get("created_at")),
                 "last_used_at": format_relative_timestamp(r.get("last_used_at")) if r.get("last_used_at") else "Never",
             })
@@ -504,3 +540,37 @@ def delete_user_passkey(uid: int, cred_id: int, client_ip: str = "127.0.0.1") ->
     log_security_event("WEBAUTHN_CREDENTIAL_DELETED", uid=uid, details=f"cred_id={cred_id}")
 
     return True, "Passkey successfully removed."
+
+
+def rename_user_passkey(uid: int, cred_id: int, new_name: str, client_ip: str = "127.0.0.1") -> Tuple[bool, str]:
+    """Rename a user's passkey credential, strictly verifying ownership."""
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return False, "Passkey name cannot be empty."
+    if len(new_name) > 100:
+        return False, "Passkey name must be 100 characters or fewer."
+
+    # Confirm ownership before updating
+    check_rows = execute_query(
+        "SELECT id, device_name FROM webauthn_credentials WHERE id = %s AND uid = %s",
+        (cred_id, uid)
+    )
+    if not isinstance(check_rows, list) or len(check_rows) == 0:
+        return False, "Passkey credential not found or access denied."
+
+    old_name = check_rows[0].get("device_name", "Passkey")
+    execute_query(
+        "UPDATE webauthn_credentials SET device_name = %s WHERE id = %s AND uid = %s",
+        (new_name, cred_id, uid)
+    )
+
+    record_audit_log(
+        "WEBAUTHN_CREDENTIAL_RENAMED",
+        actor_uid=uid,
+        ip_address=client_ip,
+        status="Success",
+        details=f"renamed id={cred_id} from='{old_name}' to='{new_name}'"
+    )
+    log_security_event("WEBAUTHN_CREDENTIAL_RENAMED", uid=uid, details=f"cred_id={cred_id}")
+
+    return True, f"Passkey renamed to '{new_name}'."

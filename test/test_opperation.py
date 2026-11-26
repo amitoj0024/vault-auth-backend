@@ -27,14 +27,12 @@ def test_auth_user_hashed_password_success(monkeypatch):
     assert captured_query[0][1] == ("alice", "alice")
 
 
-def test_auth_user_plaintext_fallback_success(monkeypatch):
+def test_auth_user_plaintext_password_is_rejected(monkeypatch):
+    """A stored plaintext password must never authenticate (SEC-01)."""
     mock_db_return = [{"uid": 2, "username": "bob", "email": "bob@example.com", "password": "legacy_plaintext"}]
     monkeypatch.setattr(opperation, "execute_query", lambda q, p=None: mock_db_return)
 
-    user = opperation.auth_user("bob", "legacy_plaintext")
-    assert user is not None
-    assert user["username"] == "bob"
-    assert "password" not in user
+    assert opperation.auth_user("bob", "legacy_plaintext") is None
 
 
 def test_auth_user_wrong_password(monkeypatch):
@@ -146,6 +144,29 @@ def test_verify_otp_success(monkeypatch):
     assert user["username"] == "dave"
     assert len(captured_updates) == 1
     assert captured_updates[0] == (1,)
+
+
+def test_verify_otp_rejects_masked_placeholder(monkeypatch):
+    """A display placeholder in otp_code must never authenticate a user."""
+    monkeypatch.setattr(
+        opperation, "get_users", lambda ident: [{"uid": 5, "username": "dave", "email": "dave@example.com"}]
+    )
+    attempts_updates = []
+
+    def mock_exec(query, params=None):
+        if "SELECT id, attempts" in query:
+            return [{"id": 1, "attempts": 0}]
+        if "UPDATE otps SET attempts" in query:
+            attempts_updates.append(params)
+            return ()
+        raise AssertionError(f"Unexpected query reached the DB: {query}")
+
+    monkeypatch.setattr(opperation, "execute_query", mock_exec)
+
+    user, err = opperation.verify_otp("dave", "******")
+    assert user is None
+    assert err == "Invalid or expired OTP"
+    assert attempts_updates == [(1,)]
 
 
 def test_verify_otp_invalid_or_expired(monkeypatch):

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="dark">
+  <meta name="supported-color-schemes" content="dark">
+  <title>Verify Your Email Address – VaultAuth SSO</title>
+  <style>
+    /* Progressive enhancement only. Every style that matters is also inline. */
+    @media only screen and (max-width: 600px) {
+      .container { width: 100% !important; }
+      .px { padding-left: 22px !important; padding-right: 22px !important; }
+      .otp-code { font-size: 32px !important; letter-spacing: 8px !important; padding-left: 8px !important; }
+      .h1 { font-size: 24px !important; line-height: 32px !important; }
+    }
+  </style>
+</head>
+<body bgcolor="#000000" style="margin:0; padding:0; width:100%; background-color:#000000; -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%;">
+
+  <!-- Preheader (inbox preview text) -->
+  <div style="display:none; font-size:1px; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden; mso-hide:all;">
+    Your VaultAuth verification code is {{ otp }}. It expires in 5 minutes.
+    &#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;&#847;&zwnj;&nbsp;
+  </div>
+
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#000000" style="background-color:#000000;">
+    <tr>
+      <td align="center" style="padding:36px 16px;">
+
+        <!-- Card -->
+        <table role="presentation" class="container" width="560" cellpadding="0" cellspacing="0" border="0" bgcolor="#000000" style="width:560px; max-width:560px; background-color:#000000; border-radius:16px; border:1px solid #1F1F1F; overflow:hidden;">
+
+          <!-- Top yellow-gold accent bar -->
+          <tr>
+            <td style="height:5px; line-height:5px; font-size:0; background-color:#FACC15; border-radius:16px 16px 0 0;">&nbsp;</td>
+          </tr>
+
+          <!-- Brand -->
+          <tr>
+            <td class="px" align="center" style="padding:36px 40px 0 40px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center">
+                <tr>
+                  <td align="center" valign="middle" width="42" height="42" bgcolor="#FACC15" style="width:42px; height:42px; background-color:#FACC15; border-radius:11px; color:#000000; font-family:Arial, Helvetica, sans-serif; font-size:21px; font-weight:800; line-height:42px; text-align:center;">V</td>
+                  <td valign="middle" style="padding-left:12px; font-family:Arial, Helvetica, sans-serif; font-size:22px; font-weight:700; color:#FFFFFF; letter-spacing:-0.3px;">VaultAuth<span style="color:#FACC15;"> SSO</span></td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Heading + intro -->
+          <tr>
+            <td class="px" align="center" style="padding:32px 40px 0 40px;">
+              <h1 class="h1" style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:28px; line-height:36px; font-weight:700; color:#FFFFFF; letter-spacing:-0.4px;">Verify Your Email Address</h1>
+              <p style="margin:14px 0 0 0; font-family:Arial, Helvetica, sans-serif; font-size:15.5px; line-height:24px; color:#D4D4D8;">
+                Welcome to VaultAuth SSO. Enter the code below to confirm your email and finish securing your account.
+              </p>
+            </td>
+          </tr>
+
+          <!-- OTP box -->
+          <tr>
+            <td class="px" align="center" style="padding:28px 40px 0 40px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#1A1608" style="background-color:#1A1608; border:1px solid #4A3D12; border-radius:12px;">
+                <tr>
+                  <td align="center" style="padding:22px 16px 8px 16px; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:16px; font-weight:700; letter-spacing:1.8px; color:#EAB308; text-transform:uppercase;">
+                    YOUR VERIFICATION CODE
+                  </td>
+                </tr>
+                <tr>
+                  <td align="center" style="padding:0 16px 24px 16px;">
+                    <div class="otp-code" style="font-family:'SF Mono', Menlo, Consolas, 'Courier New', monospace; font-size:40px; line-height:48px; font-weight:700; letter-spacing:12px; padding-left:12px; color:#FFFFFF;">{{ otp }}</div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Expiry -->
+          <tr>
+            <td class="px" align="center" style="padding:20px 40px 0 40px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#A1A1AA;">
+              This code expires in <strong style="color:#FFFFFF;">5 minutes</strong> and can be used only once.
+            </td>
+          </tr>
+
+          <!-- Security warning -->
+          <tr>
+            <td class="px" style="padding:26px 40px 0 40px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#1A1608" style="background-color:#1A1608; border:1px solid #3D3310; border-left:4px solid #EAB308; border-radius:8px;">
+                <tr>
+                  <td style="padding:14px 18px; font-family:Arial, Helvetica, sans-serif; font-size:13.5px; line-height:21px; color:#E4E4E7;">
+                    <strong style="color:#FFFFFF;">Never share this code with anyone.</strong>
+                    VaultAuth staff will never ask you for it by email, phone, or chat.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Didn't request -->
+          <tr>
+            <td class="px" style="padding:24px 40px 36px 40px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#A1A1AA;">
+              Didn&rsquo;t request this code? You can safely ignore this email &mdash; no changes will be made to your account. If you keep receiving these emails, please contact your administrator.
+            </td>
+          </tr>
+
+          <!-- Divider -->
+          <tr>
+            <td class="px" style="padding:0 40px;">
+              <div style="height:1px; line-height:1px; font-size:0; background-color:#262626;">&nbsp;</div>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td class="px" align="center" style="padding:24px 40px 32px 40px; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:19px; color:#71717A;">
+              <strong style="color:#A1A1AA;">VaultAuth SSO</strong> &middot; Unified Identity &amp; Enterprise Access Management<br>
+              This is an automated message &mdash; please do not reply to this email.<br>
+              &copy; {{ year }} VaultAuth SSO &middot; Zero Trust Workspace
+            </td>
+          </tr>
+
+        </table>
+
+        <!-- Outer note -->
+        <table role="presentation" class="container" width="560" cellpadding="0" cellspacing="0" border="0" style="width:560px; max-width:560px;">
+          <tr>
+            <td class="px" align="center" style="padding:16px 40px 0 40px; font-family:Arial, Helvetica, sans-serif; font-size:11.5px; line-height:18px; color:#52525B;">
+              Sent to {{ email }} because a verification was requested for this address.
+            </td>
+          </tr>
+        </table>
+
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

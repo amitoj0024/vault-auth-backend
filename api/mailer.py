@@ -1,9 +1,11 @@
 """Transactional email delivery for VaultAuth SSO via SMTP (TLS/SSL) and Plunk."""
 
+import datetime
 import email.utils
 import html
 import json
 import os
+from pathlib import Path
 import smtplib
 import urllib.error
 import urllib.request
@@ -174,46 +176,122 @@ def _dispatch_email(to_email, subject, html_content, text_content, context_label
     )
 
 
-def _render_otp_email_html(title, display_name, intro_text, safe_code, expiry_minutes, warning_text):
-    """Render a branded VaultAuth SSO transactional security email."""
+def _render_otp_email_html(title, display_name, intro_text, safe_code, expiry_minutes, warning_text, to_email=None):
+    """Render a branded black-and-gold VaultAuth SSO transactional OTP email."""
+    year = datetime.datetime.now().year
+    safe_email = html.escape(str(to_email)) if to_email else display_name
     return f"""<!DOCTYPE html>
-<html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
 <head>
-  <meta charset="utf-8"/>
-  <style>
-    body {{
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-      background-color: #0f172a;
-      color: #f8fafc;
-      margin: 0;
-      padding: 30px;
-    }}
-    .container {{ max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 12px; border: 1px solid #334155; padding: 32px; box-shadow: 0 10px 25px rgba(0,0,0,0.45); }}
-    .header {{ text-align: center; margin-bottom: 24px; }}
-    .brand {{ font-size: 24px; font-weight: 700; letter-spacing: -0.5px; color: #38bdf8; }}
-    .title {{ font-size: 18px; color: #e2e8f0; margin-top: 8px; font-weight: 600; }}
-    .otp-box {{ margin: 26px 0; text-align: center; background: #0f172a; border: 2px dashed #38bdf8; border-radius: 10px; padding: 18px; }}
-    .otp-code {{ font-size: 36px; font-weight: 800; letter-spacing: 8px; color: #38bdf8; font-family: 'SF Mono', Consolas, Monaco, monospace; }}
-    .info {{ font-size: 14px; color: #cbd5e1; line-height: 1.6; margin-top: 14px; }}
-    .warning {{ margin-top: 20px; padding: 12px 14px; background: rgba(245, 158, 11, 0.12); border-left: 3px solid #f59e0b; border-radius: 6px; font-size: 13px; color: #fde68a; line-height: 1.5; }}
-    .footer {{ margin-top: 28px; padding-top: 16px; border-top: 1px solid #334155; font-size: 12px; color: #94a3b8; text-align: center; }}
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="dark">
+  <meta name="supported-color-schemes" content="dark">
+  <title>{title} – VaultAuth SSO</title>
 </head>
-<body>
-  <div class="container">
-    <div class="header">
-      <div class="brand">VaultAuth SSO</div>
-      <div class="title">{title}</div>
-    </div>
-    <p class="info">Hello <strong>{display_name}</strong>,</p>
-    <p class="info">{intro_text} This code will expire in <strong>{expiry_minutes} minutes</strong>.</p>
-    <div class="otp-box"><div class="otp-code">{safe_code}</div></div>
-    <div class="warning">{warning_text}</div>
-    <div class="footer">&copy; VaultAuth SSO Security &bull; Automated identity protection notice</div>
-  </div>
+<body bgcolor="#000000" style="margin:0; padding:0; width:100%; background-color:#000000;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#000000" style="background-color:#000000;">
+    <tr>
+      <td align="center" style="padding:36px 16px;">
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" bgcolor="#000000" style="width:560px; max-width:560px; background-color:#000000; border-radius:16px; border:1px solid #1F1F1F; overflow:hidden;">
+          <tr>
+            <td style="height:5px; line-height:5px; font-size:0; background-color:#FACC15; border-radius:16px 16px 0 0;">&nbsp;</td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:36px 40px 0 40px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center">
+                <tr>
+                  <td align="center" valign="middle" width="42" height="42" bgcolor="#FACC15" style="width:42px; height:42px; background-color:#FACC15; border-radius:11px; color:#000000; font-family:Arial, Helvetica, sans-serif; font-size:21px; font-weight:800; line-height:42px; text-align:center;">V</td>
+                  <td valign="middle" style="padding-left:12px; font-family:Arial, Helvetica, sans-serif; font-size:22px; font-weight:700; color:#FFFFFF; letter-spacing:-0.3px;">VaultAuth<span style="color:#FACC15;"> SSO</span></td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:32px 40px 0 40px;">
+              <h1 style="margin:0; font-family:Arial, Helvetica, sans-serif; font-size:28px; line-height:36px; font-weight:700; color:#FFFFFF; letter-spacing:-0.4px;">{title}</h1>
+              <p style="margin:14px 0 0 0; font-family:Arial, Helvetica, sans-serif; font-size:15.5px; line-height:24px; color:#D4D4D8;">{intro_text}</p>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:28px 40px 0 40px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#1A1608" style="background-color:#1A1608; border:1px solid #4A3D12; border-radius:12px;">
+                <tr>
+                  <td align="center" style="padding:22px 16px 8px 16px; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:16px; font-weight:700; letter-spacing:1.8px; color:#EAB308; text-transform:uppercase;">
+                    YOUR VERIFICATION CODE
+                  </td>
+                </tr>
+                <tr>
+                  <td align="center" style="padding:0 16px 24px 16px;">
+                    <div style="font-family:'SF Mono', Menlo, Consolas, 'Courier New', monospace; font-size:40px; line-height:48px; font-weight:700; letter-spacing:12px; padding-left:12px; color:#FFFFFF;">{safe_code}</div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:20px 40px 0 40px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#A1A1AA;">
+              This code expires in <strong style="color:#FFFFFF;">{expiry_minutes} minutes</strong> and can be used only once.
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:26px 40px 0 40px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#1A1608" style="background-color:#1A1608; border:1px solid #3D3310; border-left:4px solid #EAB308; border-radius:8px;">
+                <tr>
+                  <td style="padding:14px 18px; font-family:Arial, Helvetica, sans-serif; font-size:13.5px; line-height:21px; color:#E4E4E7;">
+                    {warning_text}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 40px 36px 40px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:22px; color:#A1A1AA;">
+              Didn&rsquo;t request this code? You can safely ignore this email &mdash; no changes will be made to your account. If you keep receiving these emails, please contact your administrator.
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:0 40px;">
+              <div style="height:1px; line-height:1px; font-size:0; background-color:#262626;">&nbsp;</div>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" style="padding:24px 40px 32px 40px; font-family:Arial, Helvetica, sans-serif; font-size:12px; line-height:19px; color:#71717A;">
+              <strong style="color:#A1A1AA;">VaultAuth SSO</strong> &middot; Unified Identity &amp; Enterprise Access Management<br>
+              This is an automated message &mdash; please do not reply to this email.<br>
+              &copy; {year} VaultAuth SSO &middot; Zero Trust Workspace
+            </td>
+          </tr>
+        </table>
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" style="width:560px; max-width:560px;">
+          <tr>
+            <td align="center" style="padding:16px 40px 0 40px; font-family:Arial, Helvetica, sans-serif; font-size:11.5px; line-height:18px; color:#52525B;">
+              Sent to {safe_email} because a verification was requested for this address.
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
 </html>
 """
+
+
+_OTP_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "vaultauth_otp_email.html"
+
+
+def _render_otp_template(to_email, safe_otp):
+    """Load and populate vaultauth_otp_email.html for Gmail/email clients."""
+    if _OTP_TEMPLATE_PATH.is_file():
+        tpl = _OTP_TEMPLATE_PATH.read_text(encoding="utf-8")
+        return (
+            tpl.replace("{{ otp }}", safe_otp)
+            .replace("{{ email }}", html.escape(str(to_email)))
+            .replace("{{ year }}", str(datetime.datetime.now().year))
+        )
+    return None
 
 
 def send_otp_email(to_email, otp_code, username=None):
@@ -223,13 +301,14 @@ def send_otp_email(to_email, otp_code, username=None):
     safe_otp = html.escape(str(otp_code))
     subject = f"{otp_code} is your Vault Auth verification code"
 
-    html_content = _render_otp_email_html(
-        title="Login Verification Code",
+    html_content = _render_otp_template(to_email, safe_otp) or _render_otp_email_html(
+        title="Verify Your Email Address",
         display_name=display_name,
-        intro_text="Use the following One-Time Password (OTP) to complete your login.",
+        intro_text="Welcome to VaultAuth SSO. Enter the code below to confirm your email and finish securing your account.",
         safe_code=safe_otp,
         expiry_minutes=5,
-        warning_text="If you did not request this login verification code, please ignore this email and ensure your account password is secure.",
+        warning_text='<strong style="color:#FFFFFF;">Never share this code with anyone.</strong> VaultAuth staff will never ask you for it by email, phone, or chat.',
+        to_email=to_email,
     )
     text_content = (
         f"VaultAuth SSO - Verification Code\n\n"
@@ -254,7 +333,8 @@ def send_password_reset_email(to_email, otp_code, username=None):
         intro_text="We received a request to reset your VaultAuth SSO password. Enter the verification code below to continue.",
         safe_code=safe_otp,
         expiry_minutes=5,
-        warning_text="Security Warning: If you did not request a password reset, do NOT share this code with anyone. Your password remains unchanged unless you verify this code.",
+        warning_text='<strong style="color:#FFFFFF;">Never share this code with anyone.</strong> If you did not request a password reset, your password remains unchanged.',
+        to_email=to_email,
     )
     text_content = (
         f"VaultAuth SSO – Password Reset Verification\n\n"

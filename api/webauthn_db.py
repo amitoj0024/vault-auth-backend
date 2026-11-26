@@ -41,6 +41,10 @@ def create_webauthn_tables():
         execute_query(webauthn_credentials_table)
         execute_query(webauthn_challenges_table)
 
+        # Safe additive migrations — no data loss
+        execute_query("ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS backup_eligible BOOLEAN DEFAULT FALSE;")
+        execute_query("ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS backup_state BOOLEAN DEFAULT FALSE;")
+
         # Performance and integrity indexes
         execute_query("CREATE INDEX IF NOT EXISTS idx_webauthn_uid ON webauthn_credentials(uid);")
         execute_query("CREATE INDEX IF NOT EXISTS idx_webauthn_cred_id ON webauthn_credentials(credential_id);")

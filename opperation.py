@@ -29,13 +29,8 @@ def auth_user(login, password):
             except Exception:
                 is_valid = False
 
-            if not is_valid and stored_pwd == str(password):
-                is_valid = True
-                try:
-                    new_hash = generate_password_hash(str(password))
-                    execute_query("UPDATE users SET password = %s WHERE uid = %s", (new_hash, user.get("uid")))
-                except Exception:
-                    pass
+            # Plaintext passwords are never accepted. A stored value that is not
+            # a valid hash is a data-integrity error, not a credential.
 
             if is_valid:
                 return {
@@ -186,8 +181,9 @@ def create_otp(identifier, expires_in_seconds=300):
     except Exception as e:
         safe_print(f"[OTP Invalidate Previous Notice]: {e}")
 
-    # Never store plaintext OTP in DB; always store masked placeholder + SHA-256 hash
-    masked_otp = "******"
+    # Never store plaintext OTP in DB. The display placeholder must not be a
+    # plausible OTP value, otherwise it could be replayed as the code itself.
+    masked_otp = "redacted"
     query = """
     INSERT INTO otps (uid, email, otp_code, otp_hash, created_at, expires_at, used, attempts)
     VALUES (%s, %s, %s, %s, %s, %s, FALSE, 0)
@@ -253,27 +249,22 @@ def verify_otp(identifier, otp_code, max_attempts=5):
         safe_print(f"[OTP Attempt Check]: {e}")
 
     import hashlib
-    code_hash = hashlib.sha256(f"{uid}:{code}".encode()).hexdigest()
+    # Only a 6-digit code can be a valid OTP. Match exclusively against the
+    # stored hash -- never against otp_code, which holds a masked placeholder.
+    code_hash = ""
+    if len(code) == 6 and code.isdigit():
+        code_hash = hashlib.sha256(f"{uid}:{code}".encode()).hexdigest()
 
-    query = """
-    SELECT id, uid, email, otp_code, expires_at
-    FROM otps
-    WHERE uid = %s AND (otp_code = %s OR otp_hash = %s) AND used = FALSE AND expires_at >= %s
-    ORDER BY id DESC
-    LIMIT 1
-    """
-    params = (uid, code, code_hash, now)
-    res = execute_query(query, params)
-    if isinstance(res, str) and res.startswith("Error:"):
-        # Fallback if otp_hash column doesn't exist yet
-        fallback_query = """
-        SELECT id, uid, email, otp_code, expires_at
+    res = []
+    if code_hash:
+        query = """
+        SELECT id, uid, email, otp_hash, expires_at
         FROM otps
-        WHERE uid = %s AND otp_code = %s AND used = FALSE AND expires_at >= %s
+        WHERE uid = %s AND otp_hash = %s AND used = FALSE AND expires_at >= %s
         ORDER BY id DESC
         LIMIT 1
         """
-        res = execute_query(fallback_query, (uid, code, now))
+        res = execute_query(query, (uid, code_hash, now))
 
     if not isinstance(res, list) or len(res) == 0:
         # Increment attempt counter only on the active OTP row

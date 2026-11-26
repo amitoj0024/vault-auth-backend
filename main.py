@@ -72,6 +72,7 @@ from api.webauthn_service import (
     verify_passkey_authentication,
     get_user_passkeys,
     delete_user_passkey,
+    rename_user_passkey,
 )
 from api.password_reset import (
     request_password_reset,
@@ -282,11 +283,13 @@ def create_user():
         log_security_event("REGISTRATION_SUCCESS", details=f"username={username}")
 
         explicit_otp = data.get("require_otp")
-        should_send_otp = (
-            bool(explicit_otp)
-            if explicit_otp is not None
-            else (not app.config.get("TESTING") and get_runtime_security_settings().get("mfa_required"))
-        )
+        if explicit_otp is not None:
+            should_send_otp = bool(explicit_otp)
+        elif app.config.get("TESTING"):
+            should_send_otp = False
+        else:
+            # Verification is mandatory in production (PRD FR-05/FR-08).
+            should_send_otp = True
         if should_send_otp:
             return _build_otp_challenge_response(
                 data["email"],
@@ -326,11 +329,10 @@ def login():
             except Exception:
                 pass
             log_security_event("LOGIN_FAILED", details=f"identifier={login_identifier}")
-            if user_rec and len(user_rec) > 0:
-                if user_rec[0].get("is_active") is False:
-                    return jsonify({"message": "Account is deactivated. Please contact your administrator."}), 403
-                return jsonify({"message": "Invalid email or password. Passwords are case-sensitive."}), 401
-            return jsonify({"message": "User not found"}), 404
+            # Never reveal whether the email exists (FR-04 / SEC-04).
+            if user_rec and len(user_rec) > 0 and user_rec[0].get("is_active") is False:
+                return jsonify({"message": "Account is deactivated. Please contact your administrator."}), 403
+            return jsonify({"message": "Invalid email or password. Passwords are case-sensitive."}), 401
     except Exception as e:
         safe_print(f"Login error: {e}")
         return jsonify({"message": f"Error: {e}"}), 500
@@ -360,8 +362,14 @@ def login():
         runtime_cfg = {} if app.config.get("TESTING") else get_runtime_security_settings()
         timeout_seconds = runtime_cfg.get("session_timeout") or int(os.getenv("TOKEN_EXPIRATION", "3600") or 3600)
 
-        # Trigger OTP step if explicitly requested or enforced by enterprise policy
-        if data.get("require_otp") or runtime_cfg.get("mfa_required"):
+        # A session is only created after password AND OTP (FR-05 / FR-08).
+        # OTP is mandatory in production; TESTING keeps the direct-password
+        # path available for unit tests, and require_otp can force the step.
+        if app.config.get("TESTING"):
+            require_otp = bool(data.get("require_otp"))
+        else:
+            require_otp = True
+        if require_otp:
             return _build_otp_challenge_response(
                 email_val or user or login_identifier,
                 "Two-factor verification required. Code sent to",
@@ -610,8 +618,6 @@ def change_password():
             current_matches = check_password_hash(stored_pwd, str(current_password))
         except Exception:
             current_matches = False
-        if not current_matches and stored_pwd == str(current_password):
-            current_matches = True
 
         if not current_matches:
             log_security_event("PASSWORD_CHANGE_FAILED", uid=uid, ip=client_ip, details="reason=wrong_current_password")
@@ -680,6 +686,8 @@ def verify_otp_endpoint():
 
     if not identifier or not otp_code:
         return jsonify({"message": "Both identifier and OTP code are required"}), 400
+    if len(str(otp_code).strip()) != 6 or not str(otp_code).strip().isdigit():
+        return jsonify({"message": "Invalid or expired OTP"}), 401
 
     if app.config.get("TESTING"):
         user, err = verify_otp(identifier, otp_code)
@@ -1440,6 +1448,7 @@ def user_profile():
 # ─── WebAuthn / FIDO2 Passkey Endpoints ──────────────────────────────────────
 
 @app.route("/api/webauthn/register/options", methods=["POST"])
+@app.route("/api/passkeys/register/options", methods=["POST"])
 @require_auth
 def webauthn_register_options():
     """Generate registration challenge and credential creation options for authenticated user."""
@@ -1453,6 +1462,7 @@ def webauthn_register_options():
 
 
 @app.route("/api/webauthn/register/verify", methods=["POST"])
+@app.route("/api/passkeys/register/verify", methods=["POST"])
 @require_auth
 def webauthn_register_verify():
     """Verify and persist newly registered passkey credential."""
@@ -1492,6 +1502,7 @@ def webauthn_register_verify():
 
 
 @app.route("/api/webauthn/login/options", methods=["POST"])
+@app.route("/api/passkeys/login/options", methods=["POST"])
 @rate_limit(max_requests=30, window_seconds=60, key_prefix="webauthn_login_options")
 def webauthn_login_options():
     """Generate authentication options for Passkey login."""
@@ -1512,6 +1523,7 @@ def webauthn_login_options():
 
 
 @app.route("/api/webauthn/login/verify", methods=["POST"])
+@app.route("/api/passkeys/login/verify", methods=["POST"])
 @rate_limit(max_requests=15, window_seconds=60, key_prefix="webauthn_login_verify")
 def webauthn_login_verify():
     """Verify passkey assertion response and issue authenticated session."""
@@ -1584,6 +1596,7 @@ def webauthn_login_verify():
 
 
 @app.route("/api/webauthn/credentials", methods=["GET"])
+@app.route("/api/passkeys", methods=["GET"])
 @require_auth
 def webauthn_get_credentials():
     """Retrieve all registered passkeys for the authenticated user."""
@@ -1596,6 +1609,7 @@ def webauthn_get_credentials():
 
 
 @app.route("/api/webauthn/credentials/<int:cred_id>", methods=["DELETE"])
+@app.route("/api/passkeys/<int:cred_id>", methods=["DELETE"])
 @require_auth
 def webauthn_delete_credential(cred_id):
     """Delete a registered passkey credential belonging to the authenticated user."""
@@ -1608,6 +1622,26 @@ def webauthn_delete_credential(cred_id):
     except Exception as e:
         safe_print(f"WebAuthn delete credential error: {e}")
         return jsonify({"success": False, "message": f"Error deleting passkey: {e}"}), 500
+
+
+@app.route("/api/webauthn/credentials/<int:cred_id>", methods=["PATCH"])
+@app.route("/api/passkeys/<int:cred_id>", methods=["PATCH"])
+@require_auth
+def webauthn_rename_credential(cred_id):
+    """Rename a registered passkey credential belonging to the authenticated user."""
+    try:
+        data = request.get_json(silent=True) or {}
+        new_name = (data.get("deviceName") or data.get("device_name") or data.get("name") or "").strip()
+        if not new_name:
+            return jsonify({"success": False, "message": "New passkey name is required."}), 400
+        client_ip = get_client_ip(request)
+        success, msg = rename_user_passkey(g.user["uid"], cred_id, new_name, client_ip)
+        if not success:
+            return jsonify({"success": False, "message": msg}), 400
+        return jsonify({"success": True, "message": msg}), 200
+    except Exception as e:
+        safe_print(f"WebAuthn rename credential error: {e}")
+        return jsonify({"success": False, "message": f"Error renaming passkey: {e}"}), 500
 
 
 def init_app_database():
